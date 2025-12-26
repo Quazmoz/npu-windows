@@ -1,0 +1,28 @@
+# Hybrid Setup: Docker Open WebUI + Native Windows NPU Backend
+# 
+# The NPU backend runs NATIVELY on Windows (not in Docker) for actual NPU acceleration.
+# Only Open WebUI runs in Docker.
+#
+# Start order:
+# 1. Start NPU backend: conda activate ipex-npu && python intel-npu-llm/npu_server.py
+# 2. Start Open WebUI: docker compose up -d
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      # Connect to the NPU server running natively on Windows (port 8000)
+      - OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1
+      - OPENAI_API_KEY=sk-dummy-key-for-npu
+      - WEBUI_AUTH=false
+    volumes:
+      - open-webui-data:/app/backend/data
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  open-webui-data:

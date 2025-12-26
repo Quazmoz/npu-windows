@@ -1,0 +1,44 @@
+# NPU Model Cache (compiled models - large files)
+npu_model_cache/
+test_npu_cache/
+
+# Hugging Face cache
+cache/
+.cache/
+
+# Environment files (secrets)
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+*.txt
+!README.txt
+!requirements.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker (not used - native Windows setup)
+# Keep docker-compose.yml for Open WebUI
+
+# Conda
+*.conda
