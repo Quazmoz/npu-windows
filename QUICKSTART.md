@@ -14,8 +14,8 @@ Open PowerShell:
 
 ```powershell
 # Clone the repo
-git clone https://github.com/yourusername/npu-185H.git
-cd npu-185H
+git clone https://github.com/yourusername/npu-windows.git
+cd npu-windows
 
 # Install Miniconda if needed
 winget install Anaconda.Miniconda3

@@ -160,13 +160,12 @@ Get-Process python* | Stop-Process -Force
 ## 📁 Project Structure
 
 ```
-npu-185H/
+npu-windows/
 ├── start_backend.bat          # Easy startup script
 ├── intel-npu-llm/
 │   ├── npu_server.py          # NPU-accelerated LLM server
 │   ├── docker-compose.yml     # Open WebUI frontend
-│   ├── npu_model_cache/       # Compiled NPU models (auto-created)
-│   └── test_npu.py            # NPU test script
+│   └── npu_model_cache/       # Compiled NPU models (auto-created)
 └── README.md
 ```
 

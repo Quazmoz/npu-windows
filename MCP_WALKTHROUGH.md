@@ -50,4 +50,4 @@ If you have an MCP server running on port 3001 on your Windows machine:
 ## ⚠️ Note on Docker
 Because Open WebUI is in a container, it creates a boundary.
 *   **Stdio Tools**: Tools that run directly in the terminal (standard input/output) will **NOT** work directly if configured inside the Docker container unless they are installed *inside* that container.
-*   **Hostname**: Always use `host.docker.internal` to refer to services running on your main Windows Windows machine.
+*   **Hostname**: Always use `host.docker.internal` to refer to services running on your main Windows machine.
