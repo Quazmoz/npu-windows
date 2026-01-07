@@ -57,6 +57,20 @@ Select a model from the dropdown and start chatting. Check **Task Manager → NP
 
 ---
 
+## Using Your Own Open WebUI
+
+Already running Open WebUI elsewhere? Connect it to your NPU server:
+
+1. Go to **Settings → Connections → OpenAI API**
+2. Add a connection:
+   - **URL**: `http://<YOUR-WINDOWS-IP>:8000/v1`
+   - **Key**: `sk-dummy` (any value works)
+3. Save → NPU models appear in your model list!
+
+> **Find your IP**: Run `ipconfig` in PowerShell, look for your local IP (e.g., `192.168.1.x`)
+
+---
+
 ## Available Models
 
 Models verified compatible with ipex-llm NPU:

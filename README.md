@@ -71,6 +71,20 @@ docker compose up -d
 - **Open WebUI**: http://localhost:3000
 - **API Endpoint**: http://localhost:8000/v1/chat/completions
 
+### 5. Connect Your Own Open WebUI (Optional)
+
+If you already have Open WebUI running elsewhere (e.g., on a homelab server), configure it to use your NPU server:
+
+1. **In Open WebUI**: Go to **Settings → Connections → OpenAI API**
+2. **Add a new connection** with these settings:
+   - **API Base URL**: `http://<YOUR-WINDOWS-PC-IP>:8000/v1`
+   - **API Key**: `sk-dummy` (any value works, the NPU server doesn't validate keys)
+3. **Save** and your NPU models will appear in the model dropdown
+
+> **Tip**: Find your Windows IP with `ipconfig` in PowerShell. Use your local network IP (e.g., `192.168.1.x`).
+
+> **Firewall Note**: You may need to allow port 8000 through Windows Firewall for remote connections.
+
 ---
 
 ## 🤖 Supported Models
