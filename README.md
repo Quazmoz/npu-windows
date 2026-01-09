@@ -34,6 +34,27 @@ pip install --pre --upgrade ipex-llm[npu]
 pip install fastapi uvicorn pydantic
 ```
 
+### 1b. HuggingFace Authentication (For Gated Models)
+
+Some models (Llama 2, Llama 3, Llama 3.2) require HuggingFace authentication:
+
+1. **Create a HuggingFace account** at [huggingface.co](https://huggingface.co)
+2. **Accept the model license** - Visit the model page (e.g., [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)) and accept the terms
+3. **Generate an access token** at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+4. **Create a `.env` file** in the project root:
+
+```powershell
+# Create .env file with your token
+echo 'HF_TOKEN=hf_your_token_here' > .env
+```
+
+Or manually create `npu-windows/.env`:
+```
+HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+> **Note**: Without this, gated models will fail to download. Non-gated models (Qwen, DeepSeek, MiniCPM, GLM-Edge, Baichuan2) work without authentication.
+
 ### 2. Start the NPU Backend (Multiple Models)
 
 ```powershell
@@ -99,6 +120,50 @@ To use your NPU server with N8N workflows:
 3. **Select model**: Use one of the loaded model IDs (e.g., `qwen1.5-1.8b`)
 
 > **Note**: N8N uses the `/v1/responses` API endpoint, which is fully supported.
+
+### 7. Tool Calling / Function Calling (Agents)
+
+The server supports OpenAI-compatible tool/function calling for building AI agents:
+
+```json
+{
+    "model": "qwen2.5-7b",
+    "messages": [{"role": "user", "content": "What's the weather in NYC?"}],
+    "tools": [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            }
+        }
+    }],
+    "tool_choice": "auto"
+}
+```
+
+#### Tool Choice Options
+
+| `tool_choice` | Behavior |
+|---------------|----------|
+| `"auto"` | Model decides when to use tools (default) |
+| `"none"` | Disable tool calling, respond normally |
+| `"required"` | Force the model to call at least one tool |
+| `{"type": "function", "function": {"name": "get_weather"}}` | Force specific tool |
+
+#### Advanced Features
+
+- **Parallel tool calls**: Model can call multiple tools in one response
+- **Streaming tool calls**: Tool calls are detected and emitted at end of stream
+- **Retry logic**: Malformed tool calls are automatically retried (max 2 attempts)
+- **Tool validation**: Only defined tools are parsed, invalid calls are ignored
+
+**Recommended models**: `qwen2.5-7b`, `qwen2.5-3b` (larger models work better)
+
+> **Note**: Tool calling works best with 3B+ parameter models. Smaller models may struggle.
 
 ---
 
@@ -203,6 +268,42 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 ```powershell
 # Kill existing Python processes
 Get-Process python* | Stop-Process -Force
+```
+
+---
+
+## 💾 Model Storage
+
+Models are stored in two locations:
+
+| Location | Contents | Path |
+|----------|----------|------|
+| **HuggingFace Cache** | Original downloaded models | `%USERPROFILE%\.cache\huggingface\hub\` |
+| **NPU Cache** | Compiled NPU-optimized models | `intel-npu-llm\npu_model_cache\` |
+
+### Space Usage (Approximate)
+
+| Model Size | HF Cache | NPU Cache | Total |
+|------------|----------|-----------|-------|
+| 1-2B models | ~2-4 GB | ~1-2 GB | ~3-6 GB |
+| 3-4B models | ~6-8 GB | ~2-4 GB | ~8-12 GB |
+| 7-8B models | ~14-16 GB | ~4-8 GB | ~18-24 GB |
+
+### Clear Cache
+
+```powershell
+# Clear NPU cache only (will recompile on next run)
+Remove-Item -Recurse -Force .\intel-npu-llm\npu_model_cache\
+
+# Clear HuggingFace cache (will re-download models)
+Remove-Item -Recurse -Force $env:USERPROFILE\.cache\huggingface\hub\
+```
+
+### Custom Cache Location
+
+Set in your `.env` file to store models on a different drive:
+```
+HF_HOME=D:\models\huggingface
 ```
 
 ---

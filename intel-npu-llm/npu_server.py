@@ -174,7 +174,28 @@ NPU_MODEL_CACHE = os.path.join(os.path.dirname(__file__), "npu_model_cache")
 # --- OpenAI API Pydantic Models ---
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+
+# --- Tool/Function Calling Models ---
+class FunctionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+class ToolDefinition(BaseModel):
+    type: str = "function"
+    function: FunctionDefinition
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+class ToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: FunctionCall
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -182,10 +203,17 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = 512
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = False
+    tools: Optional[List[ToolDefinition]] = None
+    tool_choice: Optional[Any] = None  # "auto", "none", or specific tool
+
+class ChatCompletionMessageWithTools(BaseModel):
+    role: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
-    message: ChatMessage
+    message: ChatCompletionMessageWithTools
     finish_reason: str
 
 class ChatCompletionResponse(BaseModel):
@@ -308,6 +336,206 @@ def get_model_and_tokenizer(model_id: str):
     
     raise HTTPException(status_code=500, detail="No models loaded")
 
+# --- Tool Calling Helpers ---
+def format_tools_for_prompt(tools: List[ToolDefinition], tool_choice: Any = None) -> str:
+    """
+    Format tools into a system prompt section for Qwen.
+    
+    Args:
+        tools: List of tool definitions
+        tool_choice: "auto", "none", "required", or {"type": "function", "function": {"name": "..."}}
+    """
+    if not tools:
+        return ""
+    
+    # Handle tool_choice="none" - don't include tools at all
+    if tool_choice == "none":
+        return ""
+    
+    tools_json = []
+    for tool in tools:
+        tools_json.append({
+            "type": tool.type,
+            "function": {
+                "name": tool.function.name,
+                "description": tool.function.description or "",
+                "parameters": tool.function.parameters or {"type": "object", "properties": {}}
+            }
+        })
+    
+    # Filter to specific tool if tool_choice specifies one
+    forced_tool = None
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        forced_tool = tool_choice.get("function", {}).get("name")
+        if forced_tool:
+            tools_json = [t for t in tools_json if t["function"]["name"] == forced_tool]
+    
+    tools_str = json.dumps(tools_json, indent=2)
+    
+    # Build instruction based on tool_choice
+    if forced_tool:
+        tool_instruction = f"You MUST call the '{forced_tool}' function. Do not respond with anything else."
+    elif tool_choice == "required":
+        tool_instruction = "You MUST call at least one of the available tools. Do not respond without calling a tool."
+    else:  # "auto" or None
+        tool_instruction = "Use the tools when needed to answer the user's questions. If you don't need a tool, respond normally."
+    
+    return f"""You are a helpful assistant with access to the following tools. {tool_instruction}
+
+# Available Tools
+
+{tools_str}
+
+# Tool Call Format
+
+When you need to call a tool, respond with a JSON object in this EXACT format:
+{{"name": "function_name", "arguments": {{"arg1": "value1"}}}}
+
+For multiple tool calls, use a JSON array:
+[{{"name": "func1", "arguments": {{}}}}, {{"name": "func2", "arguments": {{}}}}]
+
+IMPORTANT: Output ONLY the JSON when calling tools, no other text."""
+
+
+def parse_tool_calls(text: str, available_tools: List[ToolDefinition] = None) -> tuple[str, List[ToolCall]]:
+    """
+    Parse tool calls from model output with improved parsing.
+    
+    Features:
+    - Parses single JSON objects
+    - Parses JSON arrays
+    - Handles code blocks
+    - Deduplicates calls
+    - Validates against available tools
+    
+    Returns (remaining_text, list_of_tool_calls).
+    """
+    import re
+    
+    tool_calls = []
+    seen_calls = set()  # For deduplication
+    remaining_text = text
+    
+    # Get list of valid tool names for validation
+    valid_tool_names = set()
+    if available_tools:
+        valid_tool_names = {t.function.name for t in available_tools}
+    
+    def add_tool_call(name: str, arguments: str, original_match: str = None):
+        """Helper to add a tool call with deduplication."""
+        # Skip if not a valid tool name (when validation is enabled)
+        if valid_tool_names and name not in valid_tool_names:
+            return False
+        
+        # Dedup key
+        dedup_key = f"{name}:{arguments}"
+        if dedup_key in seen_calls:
+            return False
+        seen_calls.add(dedup_key)
+        
+        tool_calls.append(ToolCall(
+            id=f"call-{uuid.uuid4().hex[:12]}",
+            type="function",
+            function=FunctionCall(name=name, arguments=arguments)
+        ))
+        return True
+    
+    # Strategy 1: Try to parse as a full JSON array
+    # Look for [...] patterns
+    array_pattern = r'\[\s*\{[^[\]]*\}\s*(?:,\s*\{[^[\]]*\}\s*)*\]'
+    for match in re.finditer(array_pattern, text, re.DOTALL):
+        try:
+            arr = json.loads(match.group(0))
+            if isinstance(arr, list):
+                valid_array = True
+                for item in arr:
+                    if isinstance(item, dict) and "name" in item:
+                        args = item.get("arguments", {})
+                        args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                        add_tool_call(item["name"], args_str, match.group(0))
+                    else:
+                        valid_array = False
+                if valid_array and arr:
+                    remaining_text = remaining_text.replace(match.group(0), "").strip()
+        except json.JSONDecodeError:
+            continue
+    
+    # Strategy 2: Parse individual JSON objects (more lenient)
+    # Match {"name": "...", "arguments": {...}} patterns
+    json_patterns = [
+        # Standard format
+        r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}',
+        # Reversed order
+        r'\{\s*"arguments"\s*:\s*(\{[^{}]*\})\s*,\s*"name"\s*:\s*"([^"]+)"\s*\}',
+    ]
+    
+    for pattern in json_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL):
+            try:
+                if "arguments" in pattern[:30]:  # Reversed pattern
+                    fn_args, fn_name = match.group(1), match.group(2)
+                else:
+                    fn_name, fn_args = match.group(1), match.group(2)
+                
+                # Validate arguments JSON
+                json.loads(fn_args)
+                
+                if add_tool_call(fn_name, fn_args, match.group(0)):
+                    remaining_text = remaining_text.replace(match.group(0), "").strip()
+            except (json.JSONDecodeError, Exception):
+                continue
+    
+    # Strategy 3: Parse code blocks with JSON
+    code_block_patterns = [
+        r'```json\s*([\s\S]*?)\s*```',
+        r'```\s*([\s\S]*?)\s*```',
+    ]
+    
+    for pattern in code_block_patterns:
+        for match in re.finditer(pattern, text, re.DOTALL):
+            try:
+                json_str = match.group(1).strip()
+                parsed = json.loads(json_str)
+                
+                # Handle both single object and array
+                items = parsed if isinstance(parsed, list) else [parsed]
+                
+                for item in items:
+                    if isinstance(item, dict) and "name" in item:
+                        args = item.get("arguments", {})
+                        args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                        if add_tool_call(item["name"], args_str, match.group(0)):
+                            remaining_text = remaining_text.replace(match.group(0), "").strip()
+            except (json.JSONDecodeError, Exception):
+                continue
+    
+    # Clean up remaining text
+    remaining_text = re.sub(r'\s+', ' ', remaining_text).strip()
+    
+    return remaining_text, tool_calls
+
+
+def detect_incomplete_tool_call(text: str) -> bool:
+    """
+    Detect if the model output contains an incomplete tool call JSON.
+    Used for retry logic.
+    """
+    # Check for unclosed braces/brackets that look like tool calls
+    if '{"name"' in text or "[{" in text:
+        open_braces = text.count('{') - text.count('}')
+        open_brackets = text.count('[') - text.count(']')
+        if open_braces > 0 or open_brackets > 0:
+            return True
+    return False
+
+
+def get_retry_prompt() -> str:
+    """Get a prompt to fix malformed tool call output."""
+    return """Your previous response contained a malformed tool call. Please try again.
+Output ONLY valid JSON in this format:
+{"name": "function_name", "arguments": {"param": "value"}}"""
+
+
 # --- Routes ---
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -316,11 +544,51 @@ async def chat_completions(request: ChatCompletionRequest):
     # NPU model context limits (set during compilation)
     MAX_CONTEXT_LEN = 1024
     MAX_PROMPT_LEN = 512
+    MAX_RETRY_ATTEMPTS = 2  # For malformed tool calls
     
-    # Format prompt (ChatML format for Qwen/compatible models)
+    # Check if tools are disabled via tool_choice
+    use_tools = request.tools and request.tool_choice != "none"
+    
+    # Build prompt with tool support
     prompt = ""
+    has_system = False
+    
+    # If tools are provided (and not disabled), inject them into the system prompt
+    if use_tools:
+        tools_prompt = format_tools_for_prompt(request.tools, request.tool_choice)
+        if tools_prompt:  # Will be empty if tool_choice="none"
+            prompt += f"<|im_start|>system\n{tools_prompt}<|im_end|>\n"
+            has_system = True
+    
+    # Format messages (ChatML format for Qwen/compatible models)
     for msg in request.messages:
-        prompt += f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>\n"
+        # Skip system message if we already added tools as system
+        if msg.role == "system" and has_system:
+            continue
+        
+        content = msg.content or ""
+        
+        # Handle tool results with better formatting
+        if msg.role == "tool" and msg.tool_call_id:
+            prompt += f"<|im_start|>tool\n"
+            prompt += f"Call ID: {msg.tool_call_id}\n"
+            prompt += f"Result: {content}\n"
+            prompt += "<|im_end|>\n"
+        # Handle assistant messages with tool calls
+        elif msg.role == "assistant" and msg.tool_calls:
+            # Format tool calls as clean JSON
+            tool_calls_formatted = []
+            for tc in msg.tool_calls:
+                fn = tc.get("function", {})
+                tool_calls_formatted.append({
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}")
+                })
+            prompt += f"<|im_start|>assistant\n{json.dumps(tool_calls_formatted)}<|im_end|>\n"
+        else:
+            prompt += f"<|im_start|>{msg.role}\n{content}<|im_end|>\n"
+    
     prompt += "<|im_start|>assistant\n"
 
     # Encode and check length
@@ -334,9 +602,9 @@ async def chat_completions(request: ChatCompletionRequest):
         print(f"[WARN] Input truncated to {MAX_PROMPT_LEN} tokens")
     
     # Cap max_new_tokens to stay within context limit
-    available_tokens = MAX_CONTEXT_LEN - input_length - 10  # Leave some buffer
+    available_tokens = MAX_CONTEXT_LEN - input_length - 10
     max_new_tokens = min(request.max_tokens or 512, available_tokens, 500)
-    max_new_tokens = max(max_new_tokens, 10)  # At least 10 tokens
+    max_new_tokens = max(max_new_tokens, 10)
     
     # Generation config for NPU
     gen_kwargs = dict(
@@ -345,7 +613,7 @@ async def chat_completions(request: ChatCompletionRequest):
         num_beams=1,
     )
 
-    # --- Streaming Response ---
+    # --- Streaming Response with Tool Call Detection ---
     if request.stream:
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         gen_kwargs["streamer"] = streamer
@@ -361,7 +629,14 @@ async def chat_completions(request: ChatCompletionRequest):
 
         async def stream_generator():
             request_id = f"chatcmpl-{uuid.uuid4()}"
+            accumulated_text = ""
+            tool_calls_emitted = False
+            
             for text in streamer:
+                accumulated_text += text
+                
+                # Check if we should parse tool calls (at the end)
+                # For now, stream content normally
                 chunk = {
                     "id": request_id,
                     "object": "chat.completion.chunk",
@@ -371,24 +646,89 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
             
+            # At the end, check if we detected tool calls
+            finish_reason = "stop"
+            if use_tools:
+                _, parsed_tools = parse_tool_calls(accumulated_text, request.tools)
+                if parsed_tools:
+                    finish_reason = "tool_calls"
+                    # Emit tool calls as final chunks
+                    for i, tc in enumerate(parsed_tools):
+                        tool_chunk = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": request.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "index": i,
+                                        "id": tc.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments
+                                        }
+                                    }]
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(tool_chunk)}\n\n"
+            
             end_chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": request.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
             }
             yield f"data: {json.dumps(end_chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-    # --- Standard Response ---
+    # --- Standard Response with Retry Logic ---
     else:
-        with torch.no_grad():
-            output_ids = model.generate(input_ids, **gen_kwargs)
+        generated_text = ""
+        retry_count = 0
+        current_input_ids = input_ids
         
-        generated_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
+        while retry_count <= MAX_RETRY_ATTEMPTS:
+            with torch.no_grad():
+                output_ids = model.generate(current_input_ids, **gen_kwargs)
+            
+            generated_text = tokenizer.decode(output_ids[0][current_input_ids.shape[1]:], skip_special_tokens=True)
+            
+            # Check if we need tools and got malformed output
+            if use_tools and detect_incomplete_tool_call(generated_text):
+                retry_count += 1
+                if retry_count <= MAX_RETRY_ATTEMPTS:
+                    print(f"[WARN] Malformed tool call detected, retry {retry_count}/{MAX_RETRY_ATTEMPTS}")
+                    # Add retry prompt
+                    retry_prompt = prompt + generated_text + "<|im_end|>\n"
+                    retry_prompt += f"<|im_start|>user\n{get_retry_prompt()}<|im_end|>\n"
+                    retry_prompt += "<|im_start|>assistant\n"
+                    current_input_ids = tokenizer.encode(retry_prompt, return_tensors="pt")
+                    # Re-truncate if needed
+                    if current_input_ids.shape[1] > MAX_PROMPT_LEN:
+                        current_input_ids = current_input_ids[:, -MAX_PROMPT_LEN:]
+                    continue
+            break
+        
+        # Parse tool calls if tools were requested
+        tool_calls_list = None
+        finish_reason = "stop"
+        response_content = generated_text
+        
+        if use_tools:
+            remaining_text, parsed_tool_calls = parse_tool_calls(generated_text, request.tools)
+            if parsed_tool_calls:
+                tool_calls_list = parsed_tool_calls
+                finish_reason = "tool_calls"
+                response_content = remaining_text if remaining_text else None
+                print(f"[INFO] Parsed {len(parsed_tool_calls)} tool call(s)")
 
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
@@ -397,8 +737,12 @@ async def chat_completions(request: ChatCompletionRequest):
             choices=[
                 ChatCompletionResponseChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content=generated_text),
-                    finish_reason="stop"
+                    message=ChatCompletionMessageWithTools(
+                        role="assistant", 
+                        content=response_content,
+                        tool_calls=tool_calls_list
+                    ),
+                    finish_reason=finish_reason
                 )
             ]
         )
