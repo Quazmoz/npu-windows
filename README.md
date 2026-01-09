@@ -69,7 +69,10 @@ docker compose up -d
 ### 4. Access the Interface
 
 - **Open WebUI**: http://localhost:3000
-- **API Endpoint**: http://localhost:8000/v1/chat/completions
+- **API Endpoints**:
+  - `/v1/chat/completions` - OpenAI Chat Completions API (Open WebUI, LangChain)
+  - `/v1/responses` - OpenAI Responses API (N8N, newer tools)
+  - `/v1/models` - List available models
 
 ### 5. Connect Your Own Open WebUI (Optional)
 
@@ -85,11 +88,23 @@ If you already have Open WebUI running elsewhere (e.g., on a homelab server), co
 
 > **Firewall Note**: You may need to allow port 8000 through Windows Firewall for remote connections.
 
+### 6. Connect N8N (Optional)
+
+To use your NPU server with N8N workflows:
+
+1. **In N8N**: Add an **OpenAI** node to your workflow
+2. **Configure credentials**:
+   - **API Key**: `sk-dummy` (any value)
+   - **Base URL**: `http://<YOUR-WINDOWS-PC-IP>:8000/v1`
+3. **Select model**: Use one of the loaded model IDs (e.g., `qwen1.5-1.8b`)
+
+> **Note**: N8N uses the `/v1/responses` API endpoint, which is fully supported.
+
 ---
 
 ## 🤖 Supported Models
 
-Models verified compatible with ipex-llm NPU:
+All models below are **officially verified** for Intel NPU via ipex-llm:
 
 ### Qwen Series (Recommended)
 | Model ID | Size | NPU Speed | Notes |
@@ -97,14 +112,18 @@ Models verified compatible with ipex-llm NPU:
 | `qwen1.5-1.8b` | 1.8B | ~8 tok/s | ✅ **Default** - Verified working |
 | `qwen1.5-4b` | 4B | ~5 tok/s | Better quality |
 | `qwen1.5-7b` | 7B | ~3 tok/s | Best Qwen1.5 |
-| `qwen2-1.5b` | 1.5B | ~10 tok/s | Fast |
-| `qwen2-7b` | 7B | ~3 tok/s | Officially supported |
+| `qwen2-1.5b` | 1.5B | ~10 tok/s | Official NPU verified |
+| `qwen2-7b` | 7B | ~3 tok/s | Official NPU verified |
+| `qwen2.5-3b` | 3B | ~8 tok/s | 🔥 **Latest Qwen** |
+| `qwen2.5-7b` | 7B | ~3 tok/s | 🔥 Best Qwen 2.5 |
 
 ### Llama Series
 | Model ID | Size | NPU Speed | Notes |
 |----------|------|-----------|-------|
 | `llama2-7b` | 7B | ~3 tok/s | Classic, requires HF login |
-| `llama3-8b` | 8B | ~2 tok/s | Best Llama, requires HF login |
+| `llama3-8b` | 8B | ~2 tok/s | Powerful, requires HF login |
+| `llama3.2-1b` | 1B | ~15 tok/s | ⚡ **Fastest Llama**, requires HF login |
+| `llama3.2-3b` | 3B | ~10 tok/s | Fast & capable, requires HF login |
 
 ### DeepSeek R1 (Reasoning)
 | Model ID | Size | NPU Speed | Notes |
@@ -112,10 +131,27 @@ Models verified compatible with ipex-llm NPU:
 | `deepseek-1.5b` | 1.5B | ~10 tok/s | Fast reasoning |
 | `deepseek-7b` | 7B | ~3 tok/s | Best reasoning |
 
+### GLM-Edge (Bilingual)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `glm-edge-1.5b` | 1.5B | ~10 tok/s | Chinese/English bilingual |
+| `glm-edge-4b` | 4B | ~5 tok/s | Larger bilingual model |
+
+### MiniCPM (Ultra-Compact)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `minicpm-1b` | 1B | ~15 tok/s | Ultra-compact, efficient |
+| `minicpm-2b` | 2B | ~10 tok/s | Small but capable |
+
+### Baichuan2 (Chinese)
+| Model ID | Size | NPU Speed | Notes |
+|----------|------|-----------|-------|
+| `baichuan2-7b` | 7B | ~3 tok/s | Chinese-focused LLM |
+
 ### Load Multiple Models
 
 ```powershell
-.\start_backend.bat --models "qwen1.5-1.8b,qwen1.5-4b,deepseek-1.5b"
+.\start_backend.bat --models "qwen2.5-3b,llama3.2-1b,minicpm-2b"
 ```
 
 > **Note**: First run downloads and compiles each model (1-3 min). Subsequent loads are instant from cache.

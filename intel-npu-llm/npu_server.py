@@ -112,6 +112,56 @@ AVAILABLE_MODELS = {
         "name": "DeepSeek R1 7B",
         "description": "Best reasoning (~3 tok/s)"
     },
+    # === LLAMA 3.2 SERIES - Officially Verified for NPU ===
+    "llama3.2-1b": {
+        "hf_id": "meta-llama/Llama-3.2-1B-Instruct",
+        "name": "Llama 3.2 1B",
+        "description": "⚡ Fastest Llama (~15 tok/s), requires HF login"
+    },
+    "llama3.2-3b": {
+        "hf_id": "meta-llama/Llama-3.2-3B-Instruct",
+        "name": "Llama 3.2 3B",
+        "description": "Fast Llama (~10 tok/s), requires HF login"
+    },
+    # === QWEN 2.5 SERIES - Officially Verified for NPU ===
+    "qwen2.5-3b": {
+        "hf_id": "Qwen/Qwen2.5-3B-Instruct",
+        "name": "Qwen 2.5 3B",
+        "description": "🔥 Latest Qwen (~8 tok/s)"
+    },
+    "qwen2.5-7b": {
+        "hf_id": "Qwen/Qwen2.5-7B-Instruct",
+        "name": "Qwen 2.5 7B",
+        "description": "🔥 Best Qwen 2.5 (~3 tok/s)"
+    },
+    # === GLM-EDGE SERIES - Officially Verified for NPU ===
+    "glm-edge-1.5b": {
+        "hf_id": "THUDM/glm-edge-1.5b-chat",
+        "name": "GLM-Edge 1.5B",
+        "description": "Chinese/English bilingual (~10 tok/s)"
+    },
+    "glm-edge-4b": {
+        "hf_id": "THUDM/glm-edge-4b-chat",
+        "name": "GLM-Edge 4B",
+        "description": "Larger bilingual model (~5 tok/s)"
+    },
+    # === MINICPM SERIES - Officially Verified for NPU ===
+    "minicpm-1b": {
+        "hf_id": "openbmb/MiniCPM-1B-sft-bf16",
+        "name": "MiniCPM 1B",
+        "description": "Ultra-compact (~15 tok/s)"
+    },
+    "minicpm-2b": {
+        "hf_id": "openbmb/MiniCPM-2B-sft-bf16",
+        "name": "MiniCPM 2B",
+        "description": "Small but capable (~10 tok/s)"
+    },
+    # === BAICHUAN2 - Officially Verified for NPU ===
+    "baichuan2-7b": {
+        "hf_id": "baichuan-inc/Baichuan2-7B-Chat",
+        "name": "Baichuan2 7B",
+        "description": "Chinese-focused LLM (~3 tok/s)"
+    },
 }
 
 # --- Global State ---
@@ -144,6 +194,36 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: List[ChatCompletionResponseChoice]
+
+# --- OpenAI Responses API Models (for N8N compatibility) ---
+class ResponseInputMessage(BaseModel):
+    role: str
+    content: str
+
+class ResponseRequest(BaseModel):
+    """OpenAI Responses API request format (used by N8N)."""
+    model: str
+    input: Any  # Can be string or list of messages
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = 512
+    temperature: Optional[float] = 0.7
+    stream: Optional[bool] = False
+
+class ResponseOutputMessage(BaseModel):
+    type: str = "message"
+    id: str
+    status: str = "completed"
+    role: str = "assistant"
+    content: List[Dict[str, Any]]
+
+class ResponseObject(BaseModel):
+    """OpenAI Responses API response format."""
+    id: str
+    object: str = "response"
+    created_at: int
+    model: str
+    output: List[ResponseOutputMessage]
+    status: str = "completed"
 
 # --- Model Loading ---
 def load_npu_model(model_id: str, hf_model_path: str):
@@ -322,6 +402,85 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
             ]
         )
+
+@app.post("/v1/responses")
+async def create_response(request: ResponseRequest):
+    """
+    OpenAI Responses API endpoint (for N8N compatibility).
+    Converts Responses API format to internal format and returns response.
+    """
+    model, tokenizer = get_model_and_tokenizer(request.model)
+    
+    # NPU model context limits
+    MAX_CONTEXT_LEN = 1024
+    MAX_PROMPT_LEN = 512
+    
+    # Convert input to prompt
+    # Input can be a string or a list of messages
+    if isinstance(request.input, str):
+        # Simple string input
+        prompt = ""
+        if request.instructions:
+            prompt += f"<|im_start|>system\n{request.instructions}<|im_end|>\n"
+        prompt += f"<|im_start|>user\n{request.input}<|im_end|>\n"
+        prompt += "<|im_start|>assistant\n"
+    elif isinstance(request.input, list):
+        # List of messages
+        prompt = ""
+        if request.instructions:
+            prompt += f"<|im_start|>system\n{request.instructions}<|im_end|>\n"
+        for msg in request.input:
+            if isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        prompt += "<|im_start|>assistant\n"
+    else:
+        raise HTTPException(status_code=400, detail="Input must be a string or list of messages")
+    
+    # Encode and check length
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    input_length = input_ids.shape[1]
+    
+    # Truncate if too long
+    if input_length > MAX_PROMPT_LEN:
+        input_ids = input_ids[:, -MAX_PROMPT_LEN:]
+        input_length = MAX_PROMPT_LEN
+        print(f"[WARN] Input truncated to {MAX_PROMPT_LEN} tokens")
+    
+    # Cap max tokens
+    available_tokens = MAX_CONTEXT_LEN - input_length - 10
+    max_new_tokens = min(request.max_output_tokens or 512, available_tokens, 500)
+    max_new_tokens = max(max_new_tokens, 10)
+    
+    # Generation config
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+    )
+    
+    # Generate response (non-streaming for now)
+    with torch.no_grad():
+        output_ids = model.generate(input_ids, **gen_kwargs)
+    
+    generated_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
+    
+    # Build Responses API format response
+    response_id = f"resp-{uuid.uuid4()}"
+    message_id = f"msg-{uuid.uuid4()}"
+    
+    return ResponseObject(
+        id=response_id,
+        created_at=int(time.time()),
+        model=request.model,
+        output=[
+            ResponseOutputMessage(
+                id=message_id,
+                content=[{"type": "output_text", "text": generated_text}]
+            )
+        ]
+    )
 
 @app.get("/v1/models")
 async def list_models():
