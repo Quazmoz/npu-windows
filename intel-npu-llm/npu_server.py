@@ -693,29 +693,31 @@ async def chat_completions(request: ChatCompletionRequest):
             # Calculate completion tokens unconditionally
             completion_tokens = len(tokenizer.encode(accumulated_text))
             
+            # Send the normal finish chunk
             end_chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": request.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
             yield f"data: {json.dumps(end_chunk)}\n\n"
             
-            # OpenAI specification: always append an empty choice along with the usage dict
-            usage_chunk = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": input_length,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": input_length + completion_tokens
+            # OpenAI specification: yield one final chunk with an empty choices array and the usage object
+            if request.stream_options and request.stream_options.include_usage:
+                usage_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": input_length,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": input_length + completion_tokens
+                    }
                 }
-            }
-            yield f"data: {json.dumps(usage_chunk)}\n\n"
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
                 
             yield "data: [DONE]\n\n"
 
