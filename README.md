@@ -64,7 +64,12 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 Or load specific models:
 ```powershell
-.\start_backend.bat --models "qwen-1.8b,phi3-mini,qwen-4b"
+.\start_backend.bat --models "qwen1.5-1.8b,llama3.2-1b,qwen1.5-4b"
+```
+
+Or load specific models:
+```powershell
+.\start_backend.bat --models "qwen1.5-4b"
 ```
 
 List all available models:

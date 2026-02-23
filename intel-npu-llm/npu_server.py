@@ -197,12 +197,16 @@ class ToolCall(BaseModel):
     type: str = "function"
     function: FunctionCall
 
+class StreamOptions(BaseModel):
+    include_usage: Optional[bool] = None
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     max_tokens: Optional[int] = 512
     temperature: Optional[float] = 0.7
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     tools: Optional[List[ToolDefinition]] = None
     tool_choice: Optional[Any] = None  # "auto", "none", or specific tool
 
@@ -216,12 +220,18 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatCompletionMessageWithTools
     finish_reason: str
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str = "chat.completion"
     created: int
     model: str
     choices: List[ChatCompletionResponseChoice]
+    usage: Optional[UsageInfo] = None
 
 # --- OpenAI Responses API Models (for N8N compatibility) ---
 class ResponseInputMessage(BaseModel):
@@ -644,6 +654,9 @@ async def chat_completions(request: ChatCompletionRequest):
                     "model": request.model,
                     "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
                 }
+                # When stream_options.include_usage is true, exclude usage from normal chunks
+                if request.stream_options and request.stream_options.include_usage:
+                    pass # Don't add usage to normal chunks
                 yield f"data: {json.dumps(chunk)}\n\n"
             
             # At the end, check if we detected tool calls
@@ -677,6 +690,9 @@ async def chat_completions(request: ChatCompletionRequest):
                         }
                         yield f"data: {json.dumps(tool_chunk)}\n\n"
             
+            # Calculate completion tokens unconditionally
+            completion_tokens = len(tokenizer.encode(accumulated_text))
+            
             end_chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -685,6 +701,22 @@ async def chat_completions(request: ChatCompletionRequest):
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
             }
             yield f"data: {json.dumps(end_chunk)}\n\n"
+            
+            # OpenAI specification: always append an empty choice along with the usage dict
+            usage_chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": input_length,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": input_length + completion_tokens
+                }
+            }
+            yield f"data: {json.dumps(usage_chunk)}\n\n"
+                
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
@@ -730,6 +762,10 @@ async def chat_completions(request: ChatCompletionRequest):
                 response_content = remaining_text if remaining_text else None
                 print(f"[INFO] Parsed {len(parsed_tool_calls)} tool call(s)")
 
+        # Calculate tokens
+        prompt_tokens = input_length
+        completion_tokens = current_input_ids.shape[1] - prompt_tokens if retry_count == 0 else len(tokenizer.encode(generated_text)) 
+        
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
             created=int(time.time()),
@@ -744,7 +780,12 @@ async def chat_completions(request: ChatCompletionRequest):
                     ),
                     finish_reason=finish_reason
                 )
-            ]
+            ],
+            usage=UsageInfo(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens
+            )
         )
 
 @app.post("/v1/responses")
