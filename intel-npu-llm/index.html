@@ -257,6 +257,10 @@
                 <div class="dot"></div>
                 <span id="npu-label">Connecting...</span>
             </div>
+            <div class="stat-chip" id="disk-chip" title="Model cache on disk (NPU + HuggingFace)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+                <span id="disk-label">-- GB</span>
+            </div>
             <div class="stat-chip" id="mem-chip" title="System memory usage">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
                 <span id="mem-label">--</span>
@@ -326,6 +330,8 @@
     const npuLabel     = document.getElementById('npu-label');
     const memChip      = document.getElementById('mem-chip');
     const memLabel     = document.getElementById('mem-label');
+    const diskChip     = document.getElementById('disk-chip');
+    const diskLabel    = document.getElementById('disk-label');
     const clearBtn     = document.getElementById('clear-btn');
     const tokenCounter = document.getElementById('token-counter');
 
@@ -373,6 +379,12 @@
             // Memory
             memLabel.textContent = `${data.memory.used_percent}% RAM`;
 
+            // Disk usage
+            if (data.disk) {
+                const gb = data.disk.total_gb;
+                diskLabel.textContent = gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(gb * 1024)} MB`;
+            }
+
             // NPU state
             const busy = data.npu.busy;
             npuChip.className = `stat-chip ${busy ? 'busy' : 'online'}`;
@@ -391,6 +403,7 @@
             npuChip.className = 'stat-chip offline';
             npuLabel.textContent = 'Offline';
             memLabel.textContent = '--';
+            diskLabel.textContent = '-- GB';
         }
     }
 

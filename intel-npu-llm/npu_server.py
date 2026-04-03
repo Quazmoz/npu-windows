@@ -839,10 +839,32 @@ async def health():
         "npu_lock_status": "locked" if npu_resource_lock.locked() else "free"
     }
 
+def _dir_size_gb(path: str) -> float:
+    """Return total size of a directory in GB, or 0.0 if it doesn't exist."""
+    total = 0
+    try:
+        for dirpath, _, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return round(total / (1024**3), 2)
+
 @app.get("/v1/system/status")
 async def system_status():
-    """Return system resource usage."""
+    """Return system resource usage including model disk footprint."""
     vm = psutil.virtual_memory()
+
+    # Disk sizes
+    npu_cache_gb = _dir_size_gb(NPU_MODEL_CACHE)
+    hf_home = os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+    hf_hub_path = os.path.join(hf_home, "hub")
+    hf_cache_gb = _dir_size_gb(hf_hub_path)
+
     return {
         "memory": {
             "total_gb": round(vm.total / (1024**3), 2),
@@ -859,6 +881,11 @@ async def system_status():
         "npu": {
             "config": os.environ.get("IPEX_LLM_NPU_MTL", "non-MTL"),
             "busy": is_generating or npu_resource_lock.locked()
+        },
+        "disk": {
+            "npu_cache_gb": npu_cache_gb,
+            "hf_cache_gb": hf_cache_gb,
+            "total_gb": round(npu_cache_gb + hf_cache_gb, 2)
         }
     }
 

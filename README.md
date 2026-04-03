@@ -325,6 +325,8 @@ Models are stored in two locations:
 | **HuggingFace Cache** | Original downloaded models | `%USERPROFILE%\.cache\huggingface\hub\` |
 | **NPU Cache** | Compiled NPU-optimized models | `intel-npu-llm\npu_model_cache\` |
 
+> **Tip**: The built-in chat UI at `http://localhost:8000` shows total model disk usage live in the header (disk icon chip).
+
 ### Space Usage (Approximate)
 
 | Model Size | HF Cache | NPU Cache | Total |
@@ -333,22 +335,75 @@ Models are stored in two locations:
 | 3-4B models | ~6-8 GB | ~2-4 GB | ~8-12 GB |
 | 7-8B models | ~14-16 GB | ~4-8 GB | ~18-24 GB |
 
-### Clear Cache
+---
+
+### 🧹 Cache Management Commands
+
+#### Check How Much Space Caches Are Using
 
 ```powershell
-# Clear NPU cache only (will recompile on next run)
-Remove-Item -Recurse -Force .\intel-npu-llm\npu_model_cache\
+# NPU cache size (compiled models)
+"{0:N2} GB" -f ((Get-ChildItem -Recurse .\intel-npu-llm\npu_model_cache\ -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB)
 
-# Clear HuggingFace cache (will re-download models)
-Remove-Item -Recurse -Force $env:USERPROFILE\.cache\huggingface\hub\
+# HuggingFace cache size (downloaded weights)
+"{0:N2} GB" -f ((Get-ChildItem -Recurse "$env:USERPROFILE\.cache\huggingface\hub\" -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB)
+
+# Both combined
+$npu = (Get-ChildItem -Recurse .\intel-npu-llm\npu_model_cache\ -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB
+$hf  = (Get-ChildItem -Recurse "$env:USERPROFILE\.cache\huggingface\hub\" -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB
+"NPU cache: {0:N2} GB  |  HF cache: {1:N2} GB  |  Total: {2:N2} GB" -f $npu, $hf, ($npu + $hf)
 ```
 
-### Custom Cache Location
+#### Clear NPU Cache (Keeps HF Downloads — Fastest to Rebuild)
 
-Set in your `.env` file to store models on a different drive:
+```powershell
+# Clear ALL compiled NPU models (recompiles on next run, no re-download needed)
+Remove-Item -Recurse -Force .\intel-npu-llm\npu_model_cache\
+```
+
+#### Clear a Single Model's NPU Cache
+
+```powershell
+# Example: remove only Qwen2.5-7B compiled cache
+Remove-Item -Recurse -Force ".\intel-npu-llm\npu_model_cache\Qwen_Qwen2.5-7B-Instruct\"
+
+# List all compiled NPU model folders to find the right name
+Get-ChildItem .\intel-npu-llm\npu_model_cache\
+```
+
+#### Clear HuggingFace Download Cache
+
+> ⚠️ This will force a full re-download on next use. Only do this if you need to free maximum disk space.
+
+```powershell
+# Clear ALL HuggingFace downloads
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\"
+
+# Clear a specific model from HF cache (example: Qwen2.5-7B)
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\models--Qwen--Qwen2.5-7B-Instruct\"
+
+# List all downloaded HF models
+Get-ChildItem "$env:USERPROFILE\.cache\huggingface\hub\" -Directory
+```
+
+#### Nuclear Option — Clear Everything
+
+```powershell
+# Remove both NPU compiled cache AND HuggingFace downloads
+Remove-Item -Recurse -Force .\intel-npu-llm\npu_model_cache\ -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\" -ErrorAction SilentlyContinue
+Write-Host "All model caches cleared. Models will re-download and recompile on next run."
+```
+
+#### Custom Cache Location
+
+Set in your `.env` file to store HuggingFace models on a different drive (great for SSDs with limited C: space):
+
 ```
 HF_HOME=D:\models\huggingface
 ```
+
+The NPU cache location is fixed at `intel-npu-llm\npu_model_cache\` relative to the project directory.
 
 ---
 
