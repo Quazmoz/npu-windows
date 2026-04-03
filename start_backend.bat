@@ -12,9 +12,11 @@ REM   - Core Ultra Series 2 (Arrow Lake): 2xxK/H - no special config
 REM   - Core Ultra (Lunar Lake): 2xxV - no special config
 REM
 REM Usage:
-REM   start_backend.bat              - Load default models
-REM   start_backend.bat --list       - Show all available models
-REM   start_backend.bat --models X   - Load specific models
+REM   start_backend.bat                - Load default models
+REM   start_backend.bat --list         - Show all available models
+REM   start_backend.bat --models X     - Load specific models
+REM   start_backend.bat --port 8001    - Change default port
+REM   start_backend.bat --models X --port Y  - Multi-argument support
 
 echo ========================================
 echo   Intel NPU LLM Backend Server

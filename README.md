@@ -77,6 +77,16 @@ List all available models:
 .\start_backend.bat --list
 ```
 
+Change the server port (if 8000 is occupied):
+```powershell
+.\start_backend.bat --port 8001
+```
+
+Mixed usage:
+```powershell
+.\start_backend.bat --models "qwen1.5-4b" --port 8080
+```
+
 Or manually:
 ```powershell
 $env:IPEX_LLM_NPU_MTL = "1"  # For Meteor Lake (Core Ultra Series 1)
@@ -247,6 +257,7 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 |----------|-------|-------------|
 | `IPEX_LLM_NPU_MTL` | `1` | Required for Meteor Lake (Core Ultra Series 1) |
 | `HF_HOME` | path | Hugging Face cache directory |
+| `PORT` | `8001` | Default port for the server |
 
 ### Processor-Specific Settings
 

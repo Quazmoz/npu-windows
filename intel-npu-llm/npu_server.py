@@ -17,12 +17,22 @@ import torch
 import json
 import asyncio
 import os
+import logging
+import psutil
 from pathlib import Path
 from threading import Thread
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("npu-server")
 
 # Load .env file for HuggingFace token
 def load_env_file():
@@ -33,7 +43,7 @@ def load_env_file():
     ]
     for env_path in env_paths:
         if env_path.exists():
-            print(f"Loading environment from: {env_path}")
+            logger.info(f"Loading environment from: {env_path}")
             with open(env_path) as f:
                 for line in f:
                     line = line.strip()
@@ -49,10 +59,10 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"
 if HF_TOKEN:
     os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
     os.environ["HF_TOKEN"] = HF_TOKEN
-    print(f"HuggingFace token loaded (length: {len(HF_TOKEN)})")
+    logger.info(f"HuggingFace token loaded (length: {len(HF_TOKEN)})")
 else:
-    print("No HuggingFace token found. Gated models (Llama) will not work.")
-    print("To use Llama models, create a .env file with: HF_TOKEN=hf_your_token_here")
+    logger.warning("No HuggingFace token found. Gated models (Llama) will not work.")
+    logger.info("To use Llama models, create a .env file with: HF_TOKEN=hf_your_token_here")
 
 # CRITICAL: Use the NPU-specific model loader!
 from ipex_llm.transformers.npu_model import AutoModelForCausalLM
@@ -60,113 +70,30 @@ from transformers import AutoTokenizer, TextIteratorStreamer
 
 app = FastAPI(title="Intel NPU LLM Server")
 
+@app.get("/", response_class=FileResponse)
+async def read_index():
+    """Serve the built-in test UI."""
+    return FileResponse(Path(__file__).parent / "index.html")
+
 # --- Available Models Configuration ---
-# Models verified compatible with ipex-llm NPU (from official docs)
-AVAILABLE_MODELS = {
-    # === QWEN 1.5 SERIES - Verified Working ===
-    "qwen1.5-1.8b": {
-        "hf_id": "Qwen/Qwen1.5-1.8B-Chat",
-        "name": "Qwen1.5 1.8B",
-        "description": "✅ VERIFIED - Fast, stable (~8 tok/s)"
-    },
-    "qwen1.5-4b": {
-        "hf_id": "Qwen/Qwen1.5-4B-Chat",
-        "name": "Qwen1.5 4B",
-        "description": "Better quality (~5 tok/s)"
-    },
-    "qwen1.5-7b": {
-        "hf_id": "Qwen/Qwen1.5-7B-Chat",
-        "name": "Qwen1.5 7B",
-        "description": "Best Qwen1.5 quality (~3 tok/s)"
-    },
-    # === QWEN 2 SERIES - Officially Listed ===
-    "qwen2-1.5b": {
-        "hf_id": "Qwen/Qwen2-1.5B-Instruct",
-        "name": "Qwen2 1.5B",
-        "description": "Fast Qwen2 (~10 tok/s)"
-    },
-    "qwen2-7b": {
-        "hf_id": "Qwen/Qwen2-7B-Instruct",
-        "name": "Qwen2 7B",
-        "description": "Officially supported (~3 tok/s)"
-    },
-    # === LLAMA SERIES - Officially Listed ===
-    "llama2-7b": {
-        "hf_id": "meta-llama/Llama-2-7b-chat-hf",
-        "name": "Llama 2 7B",
-        "description": "Classic Llama (~3 tok/s)"
-    },
-    "llama3-8b": {
-        "hf_id": "meta-llama/Meta-Llama-3-8B-Instruct",
-        "name": "Llama 3 8B",
-        "description": "Best open Llama (~2 tok/s)"
-    },
-    # === DEEPSEEK - Officially Listed ===
-    "deepseek-1.5b": {
-        "hf_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-        "name": "DeepSeek R1 1.5B",
-        "description": "Reasoning model (~10 tok/s)"
-    },
-    "deepseek-7b": {
-        "hf_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        "name": "DeepSeek R1 7B",
-        "description": "Best reasoning (~3 tok/s)"
-    },
-    # === LLAMA 3.2 SERIES - Officially Verified for NPU ===
-    "llama3.2-1b": {
-        "hf_id": "meta-llama/Llama-3.2-1B-Instruct",
-        "name": "Llama 3.2 1B",
-        "description": "⚡ Fastest Llama (~15 tok/s), requires HF login"
-    },
-    "llama3.2-3b": {
-        "hf_id": "meta-llama/Llama-3.2-3B-Instruct",
-        "name": "Llama 3.2 3B",
-        "description": "Fast Llama (~10 tok/s), requires HF login"
-    },
-    # === QWEN 2.5 SERIES - Officially Verified for NPU ===
-    "qwen2.5-3b": {
-        "hf_id": "Qwen/Qwen2.5-3B-Instruct",
-        "name": "Qwen 2.5 3B",
-        "description": "🔥 Latest Qwen (~8 tok/s)"
-    },
-    "qwen2.5-7b": {
-        "hf_id": "Qwen/Qwen2.5-7B-Instruct",
-        "name": "Qwen 2.5 7B",
-        "description": "🔥 Best Qwen 2.5 (~3 tok/s)"
-    },
-    # === GLM-EDGE SERIES - Officially Verified for NPU ===
-    "glm-edge-1.5b": {
-        "hf_id": "THUDM/glm-edge-1.5b-chat",
-        "name": "GLM-Edge 1.5B",
-        "description": "Chinese/English bilingual (~10 tok/s)"
-    },
-    "glm-edge-4b": {
-        "hf_id": "THUDM/glm-edge-4b-chat",
-        "name": "GLM-Edge 4B",
-        "description": "Larger bilingual model (~5 tok/s)"
-    },
-    # === MINICPM SERIES - Officially Verified for NPU ===
-    "minicpm-1b": {
-        "hf_id": "openbmb/MiniCPM-1B-sft-bf16",
-        "name": "MiniCPM 1B",
-        "description": "Ultra-compact (~15 tok/s)"
-    },
-    "minicpm-2b": {
-        "hf_id": "openbmb/MiniCPM-2B-sft-bf16",
-        "name": "MiniCPM 2B",
-        "description": "Small but capable (~10 tok/s)"
-    },
-    # === BAICHUAN2 - Officially Verified for NPU ===
-    "baichuan2-7b": {
-        "hf_id": "baichuan-inc/Baichuan2-7B-Chat",
-        "name": "Baichuan2 7B",
-        "description": "Chinese-focused LLM (~3 tok/s)"
-    },
-}
+def load_models_config():
+    """Load model definitions from models.json."""
+    config_path = Path(__file__).parent / "models.json"
+    if config_path.exists():
+        try:
+            with open(config_path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load models.json: {e}")
+    return {}
+
+AVAILABLE_MODELS = load_models_config()
 
 # --- Global State ---
 loaded_models: Dict[str, Any] = {}
 default_model_id = "qwen1.5-1.8b"  # Use the verified working model
+npu_resource_lock = asyncio.Lock()  # Ensure only one generation at a time
+is_generating = False  # Explicit state for tracking
 
 # --- NPU Model Cache Directory ---
 NPU_MODEL_CACHE = os.path.join(os.path.dirname(__file__), "npu_model_cache")
@@ -268,11 +195,10 @@ def load_npu_model(model_id: str, hf_model_path: str):
     """Load a single model with NPU optimization."""
     global loaded_models
     
-    print(f"\n{'='*50}")
-    print(f"Loading '{model_id}' ({hf_model_path}) for Intel NPU...")
+    logger.info(f"Loading '{model_id}' ({hf_model_path}) for Intel NPU...")
     
     npu_env = os.environ.get("IPEX_LLM_NPU_MTL", "not set")
-    print(f" NPU Environment: IPEX_LLM_NPU_MTL={npu_env}")
+    logger.info(f"NPU Environment: IPEX_LLM_NPU_MTL={npu_env}")
     
     # Create cache directory for NPU model
     model_cache_dir = os.path.join(NPU_MODEL_CACHE, hf_model_path.replace("/", "_"))
@@ -280,8 +206,8 @@ def load_npu_model(model_id: str, hf_model_path: str):
     if not os.path.exists(model_cache_dir):
         # Create parent directories and convert model
         os.makedirs(model_cache_dir, exist_ok=True)
-        print(f" Converting model to NPU format (first time only)...")
-        print(f" Cache: {model_cache_dir}")
+        logger.info(f"Converting model to NPU format (first time only)...")
+        logger.info(f"Cache: {model_cache_dir}")
         model = AutoModelForCausalLM.from_pretrained(
             hf_model_path,
             torch_dtype=torch.float16,
@@ -295,39 +221,35 @@ def load_npu_model(model_id: str, hf_model_path: str):
         )
         tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
         tokenizer.save_pretrained(model_cache_dir)
-        print(f" -> Model converted and cached.")
+        logger.info(f" -> Model converted and cached.")
     else:
-        print(f" Loading from cache: {model_cache_dir}")
+        logger.info(f"Loading from cache: {model_cache_dir}")
         model = AutoModelForCausalLM.load_low_bit(
             model_cache_dir,
             attn_implementation="eager"
         )
         tokenizer = AutoTokenizer.from_pretrained(model_cache_dir, trust_remote_code=True)
-        print(f" -> Loaded from cache.")
+        logger.info(f" -> Loaded from cache.")
     
     loaded_models[model_id] = {
         "model": model,
         "tokenizer": tokenizer,
         "hf_id": hf_model_path
     }
-    print(f" ✓ '{model_id}' ready on Intel NPU!")
+    logger.info(f" ✓ '{model_id}' ready on Intel NPU!")
 
 def load_all_models(model_ids: List[str]):
     """Load all specified models at startup."""
-    print("\n" + "="*60)
-    print("  Intel NPU LLM Server - Loading Models")
-    print("="*60)
+    logger.info(f"Intel NPU LLM Server - Loading {len(model_ids)} Model(s)")
     
     for model_id in model_ids:
         if model_id in AVAILABLE_MODELS:
             hf_id = AVAILABLE_MODELS[model_id]["hf_id"]
             load_npu_model(model_id, hf_id)
         else:
-            print(f"WARNING: Unknown model '{model_id}', skipping.")
+            logger.warning(f"Unknown model '{model_id}', skipping.")
     
-    print("\n" + "="*60)
-    print(f"  {len(loaded_models)} model(s) loaded and ready!")
-    print("="*60 + "\n")
+    logger.info(f"Total models ready: {len(loaded_models)}")
 
 def get_model_and_tokenizer(model_id: str):
     """Get model and tokenizer for the given model ID."""
@@ -609,7 +531,7 @@ async def chat_completions(request: ChatCompletionRequest):
     if input_length > MAX_PROMPT_LEN:
         input_ids = input_ids[:, -MAX_PROMPT_LEN:]
         input_length = MAX_PROMPT_LEN
-        print(f"[WARN] Input truncated to {MAX_PROMPT_LEN} tokens")
+        logger.warning(f"Input truncated to {MAX_PROMPT_LEN} tokens")
     
     # Cap max_new_tokens to stay within context limit
     available_tokens = MAX_CONTEXT_LEN - input_length - 10
@@ -628,14 +550,19 @@ async def chat_completions(request: ChatCompletionRequest):
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         gen_kwargs["streamer"] = streamer
         
-        def generate_in_thread():
-            try:
-                model.generate(input_ids, **gen_kwargs)
-            except Exception as e:
-                print(f"[ERROR] Generation failed: {e}")
+        async def generate_with_lock():
+            global is_generating
+            async with npu_resource_lock:
+                is_generating = True
+                try:
+                    await asyncio.get_event_loop().run_in_executor(None, lambda: model.generate(input_ids, **gen_kwargs))
+                except Exception as e:
+                    logger.error(f"Generation failed: {e}")
+                finally:
+                    is_generating = False
         
-        thread = Thread(target=generate_in_thread)
-        thread.start()
+        # Start generation in a background task
+        asyncio.create_task(generate_with_lock())
 
         async def stream_generator():
             request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -730,8 +657,18 @@ async def chat_completions(request: ChatCompletionRequest):
         current_input_ids = input_ids
         
         while retry_count <= MAX_RETRY_ATTEMPTS:
-            with torch.no_grad():
-                output_ids = model.generate(current_input_ids, **gen_kwargs)
+            global is_generating
+            async with npu_resource_lock:
+                is_generating = True
+                try:
+                    with torch.no_grad():
+                        # Move to CPU context for token limit check if needed, but staying in executors for safety
+                        output_ids = await asyncio.get_event_loop().run_in_executor(
+                            None, 
+                            lambda: model.generate(current_input_ids, **gen_kwargs)
+                        )
+                finally:
+                    is_generating = False
             
             generated_text = tokenizer.decode(output_ids[0][current_input_ids.shape[1]:], skip_special_tokens=True)
             
@@ -739,7 +676,7 @@ async def chat_completions(request: ChatCompletionRequest):
             if use_tools and detect_incomplete_tool_call(generated_text):
                 retry_count += 1
                 if retry_count <= MAX_RETRY_ATTEMPTS:
-                    print(f"[WARN] Malformed tool call detected, retry {retry_count}/{MAX_RETRY_ATTEMPTS}")
+                    logger.warning(f"Malformed tool call detected, retry {retry_count}/{MAX_RETRY_ATTEMPTS}")
                     # Add retry prompt
                     retry_prompt = prompt + generated_text + "<|im_end|>\n"
                     retry_prompt += f"<|im_start|>user\n{get_retry_prompt()}<|im_end|>\n"
@@ -762,7 +699,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 tool_calls_list = parsed_tool_calls
                 finish_reason = "tool_calls"
                 response_content = remaining_text if remaining_text else None
-                print(f"[INFO] Parsed {len(parsed_tool_calls)} tool call(s)")
+                logger.info(f"Parsed {len(parsed_tool_calls)} tool call(s)")
 
         # Calculate tokens
         prompt_tokens = input_length
@@ -833,7 +770,7 @@ async def create_response(request: ResponseRequest):
     if input_length > MAX_PROMPT_LEN:
         input_ids = input_ids[:, -MAX_PROMPT_LEN:]
         input_length = MAX_PROMPT_LEN
-        print(f"[WARN] Input truncated to {MAX_PROMPT_LEN} tokens")
+        logger.warning(f"Input truncated to {MAX_PROMPT_LEN} tokens")
     
     # Cap max tokens
     available_tokens = MAX_CONTEXT_LEN - input_length - 10
@@ -847,9 +784,18 @@ async def create_response(request: ResponseRequest):
         num_beams=1,
     )
     
-    # Generate response (non-streaming for now)
-    with torch.no_grad():
-        output_ids = model.generate(input_ids, **gen_kwargs)
+    # Generate response
+    global is_generating
+    async with npu_resource_lock:
+        is_generating = True
+        try:
+            with torch.no_grad():
+                output_ids = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: model.generate(input_ids, **gen_kwargs)
+                )
+        finally:
+            is_generating = False
     
     generated_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
     
@@ -888,7 +834,34 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "models_loaded": len(loaded_models)}
+    return {
+        "status": "ok", 
+        "models_loaded": len(loaded_models),
+        "npu_lock_status": "locked" if npu_resource_lock.locked() else "free"
+    }
+
+@app.get("/v1/system/status")
+async def system_status():
+    """Return system resource usage."""
+    vm = psutil.virtual_memory()
+    return {
+        "memory": {
+            "total_gb": round(vm.total / (1024**3), 2),
+            "available_gb": round(vm.available / (1024**3), 2),
+            "used_percent": vm.percent
+        },
+        "cpu": {
+            "percent": psutil.cpu_percent(interval=None)
+        },
+        "models": {
+            "loaded": list(loaded_models.keys()),
+            "count": len(loaded_models)
+        },
+        "npu": {
+            "config": os.environ.get("IPEX_LLM_NPU_MTL", "non-MTL"),
+            "busy": is_generating or npu_resource_lock.locked()
+        }
+    }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Intel NPU LLM Server")
@@ -898,7 +871,10 @@ if __name__ == "__main__":
         default="qwen-1.8b",
         help="Comma-separated list of models to load (e.g., 'qwen-1.8b,qwen2-1.5b,phi3-mini')"
     )
-    parser.add_argument("--port", type=int, default=8000, help="Port to run server on")
+    
+    # Use PORT environment variable as default if available
+    default_port = int(os.environ.get("PORT", 8000))
+    parser.add_argument("--port", type=int, default=default_port, help=f"Port to run server on (default: {default_port})")
     parser.add_argument("--list", action="store_true", help="List available models and exit")
     args = parser.parse_args()
     
@@ -918,7 +894,7 @@ if __name__ == "__main__":
     # Load models
     load_all_models(model_ids)
     
-    print(f"Server starting on http://0.0.0.0:{args.port}")
-    print(f"Models available: {', '.join(loaded_models.keys())}")
+    logger.info(f"Server starting on http://0.0.0.0:{args.port}")
+    logger.info(f"Models available: {', '.join(loaded_models.keys())}")
     
     uvicorn.run(app, host="0.0.0.0", port=args.port)
