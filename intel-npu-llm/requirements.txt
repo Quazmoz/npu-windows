@@ -1,11 +1,27 @@
 # Core dependencies for Intel NPU LLM Server
 # Install with: pip install -r requirements.txt
-# Note: ipex-llm with NPU support must be installed first
+#
+# NOTE: ipex-llm with NPU support must be installed FIRST via:
+#   pip install --pre --upgrade ipex-llm[npu]
+#
+# ⚠️  DO NOT upgrade torch or transformers independently.
+#     They are tightly pinned by ipex-llm for NPU kernel compatibility.
+#     Only upgrade them together when Intel releases a new ipex-llm[npu] build.
+#
+# Current working versions (as of 2026-04):
+#   ipex-llm==2.3.0b20250626  (NPU build, installed separately)
+#   torch==2.1.2              (pinned by ipex-llm)
+#   transformers==4.40.0      (pinned by ipex-llm)
 
-fastapi>=0.100.0
+# Web server stack — safe to upgrade within these bounds
+fastapi>=0.100.0,<0.135.0    # <0.135 avoids strict_content_type default change
 uvicorn>=0.22.0
 pydantic>=2.0.0
-torch
-transformers>=4.38.0
-python-dotenv
-psutil
+
+# ML stack — DO NOT change these; managed by ipex-llm[npu]
+torch==2.1.2
+transformers==4.40.0
+
+# Utilities — already on latest, safe to float
+python-dotenv>=1.0.0
+psutil>=5.9.0
