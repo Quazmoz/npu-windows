@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from dotenv import load_dotenv
 
 # --- Logging Configuration ---
 logging.basicConfig(
@@ -35,24 +36,22 @@ logging.basicConfig(
 logger = logging.getLogger("npu-server")
 
 # Load .env file for HuggingFace token
-def load_env_file():
-    """Load environment variables from .env file if it exists."""
+def find_and_load_dotenv():
+    """Search for .env in current and parent directories and load it."""
+    # Look for .env in two places:
+    # 1. intel-npu-llm/.env (where the script is)
+    # 2. repo root/.env (where start_backend.bat is)
     env_paths = [
-        Path(__file__).parent / ".env",  # intel-npu-llm/.env
-        Path(__file__).parent.parent / ".env",  # repo root/.env
+        Path(__file__).parent / ".env",
+        Path(__file__).parent.parent / ".env"
     ]
-    for env_path in env_paths:
-        if env_path.exists():
-            logger.info(f"Loading environment from: {env_path}")
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+    for p in env_paths:
+        if p.exists():
+            logger.info(f"Loading environment from: {p}")
+            load_dotenv(dotenv_path=p)
             break
 
-load_env_file()
+find_and_load_dotenv()
 
 # Set HuggingFace token if available
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")

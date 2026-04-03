@@ -44,8 +44,8 @@ Some models (Llama 2, Llama 3, Llama 3.2) require HuggingFace authentication:
 4. **Create a `.env` file** in the project root:
 
 ```powershell
-# Create .env file with your token
-echo 'HF_TOKEN=hf_your_token_here' > .env
+# Create .env file with your token (UTF-8 encoding is important!)
+'HF_TOKEN=hf_your_token_here' | Out-File -FilePath .env -Encoding utf8
 ```
 
 Or manually create `npu-windows/.env`:
