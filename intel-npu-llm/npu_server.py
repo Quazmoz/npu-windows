@@ -920,7 +920,9 @@ if __name__ == "__main__":
     # Load models
     load_all_models(model_ids)
     
-    logger.info(f"Server starting on http://0.0.0.0:{args.port}")
+    logger.info(f"Server starting! Visit: http://localhost:{args.port}")
     logger.info(f"Models available: {', '.join(loaded_models.keys())}")
     
+    # Bind to all interfaces (0.0.0.0) but uvicorn will still log 0.0.0.0 by default.
+    # To avoid confusing the user, we print a clear URL above.
     uvicorn.run(app, host="0.0.0.0", port=args.port)

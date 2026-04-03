@@ -50,7 +50,7 @@ Llama 2, Llama 3, and Llama 3.2 require accepting the license and a HF token.
 Wait for the ready message:
 ```
 ✓ 'qwen1.5-1.8b' ready on Intel NPU!
-Server starting on http://0.0.0.0:8000
+Server starting! Visit: http://localhost:8000
 ```
 
 ---
