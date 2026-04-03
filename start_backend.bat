@@ -83,6 +83,15 @@ if errorlevel 1 (
 echo Conda: !CONDA_PATH! [ipex-npu]
 echo.
 
+REM ---- Ensure dependencies are installed ----
+echo Checking dependencies...
+pip install -r "%~dp0intel-npu-llm\requirements.txt" --quiet
+if errorlevel 1 (
+    echo WARNING: Some dependencies may be missing. If the server fails to start,
+    echo run: pip install -r intel-npu-llm\requirements.txt
+)
+echo.
+
 cd /d "%~dp0intel-npu-llm"
 
 REM ---- Start server ----

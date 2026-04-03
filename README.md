@@ -5,8 +5,14 @@ Run Large Language Models on your Intel Core Ultra NPU with an OpenAI-compatible
 ## 🎯 Features
 
 - **NPU Acceleration**: Leverage Intel's Neural Processing Unit for power-efficient AI
-- **OpenAI-Compatible API**: Works with any OpenAI client, including Open WebUI
-- **Local & Private**: All processing happens on your device
+- **OpenAI-Compatible API**: Works with any OpenAI client (Open WebUI, LangChain, N8N)
+- **Built-in Chat UI**: Beautiful dark-mode interface at `http://localhost:8000` — no Docker needed
+- **Multi-Model Support**: Load and switch between multiple models from the UI
+- **Conversation History**: Full multi-turn context management
+- **Markdown Rendering**: Clean formatting for code blocks, lists, and structured output
+- **Real-time Monitoring**: Live NPU status, memory usage, and system telemetry
+- **Tool Calling**: Function calling support for building AI agents
+- **Local & Private**: All processing happens on your device — nothing leaves your machine
 - **Power Efficient**: ~3-5x less power than CPU inference
 
 ## 📋 Requirements
@@ -106,11 +112,22 @@ docker compose up -d
 
 ### 4. Access the Interface
 
-- **Open WebUI**: http://localhost:3000
-- **API Endpoints**:
-  - `/v1/chat/completions` - OpenAI Chat Completions API (Open WebUI, LangChain)
-  - `/v1/responses` - OpenAI Responses API (N8N, newer tools)
-  - `/v1/models` - List available models
+#### Built-in Chat UI (No Docker Required)
+Open **http://localhost:8000** in your browser for a full-featured chat interface:
+- Real-time NPU status with animated indicators
+- Model selector dropdown (loaded models populate automatically)
+- Conversation history with multi-turn context
+- Markdown rendering (code blocks, lists, bold/italic)
+- Keyboard shortcuts: `Enter` to send, `Shift+Enter` for newline, `Ctrl+L` to clear
+- Live token counter and system memory display
+
+#### API Endpoints
+- `/` — Built-in Chat UI
+- `/v1/chat/completions` — OpenAI Chat Completions API (Open WebUI, LangChain, curl)
+- `/v1/responses` — OpenAI Responses API (N8N)
+- `/v1/models` — List loaded models
+- `/v1/system/status` — System telemetry (memory, CPU, NPU busy state)
+- `/health` — Health check
 
 ### 5. Connect Your Own Open WebUI (Optional)
 
@@ -339,12 +356,17 @@ HF_HOME=D:\models\huggingface
 
 ```
 npu-windows/
-├── start_backend.bat          # Easy startup script
-├── intel-npu-llm/
-│   ├── npu_server.py          # NPU-accelerated LLM server
-│   ├── docker-compose.yml     # Open WebUI frontend
-│   └── npu_model_cache/       # Compiled NPU models (auto-created)
-└── README.md
+├── start_backend.bat             # One-click startup with auto CPU detection
+├── QUICKSTART.md                 # 5-minute getting started guide
+├── README.md                     # Full documentation
+└── intel-npu-llm/
+    ├── npu_server.py             # NPU-accelerated LLM server (FastAPI)
+    ├── index.html                # Built-in dark-mode chat UI
+    ├── models.json               # Model registry (add custom models here)
+    ├── docker-compose.yml        # Open WebUI frontend (optional)
+    ├── requirements.txt          # Python dependencies
+    ├── .env.example              # Environment variable template
+    └── npu_model_cache/          # Compiled NPU models (auto-created on first run)
 ```
 
 ---

@@ -1,31 +1,45 @@
 # Quick Start Guide
 
-Get your Intel NPU running LLMs in 5 minutes.
+Get your Intel NPU running LLMs in under 10 minutes.
 
 ## Prerequisites
 
-- Intel Core Ultra processor (Series 1, 2, or Lunar Lake)
+- Intel Core Ultra processor (Series 1 Meteor Lake, Series 2 Arrow Lake, or Lunar Lake)
 - Windows 11
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (for Open WebUI)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) *(optional — only needed for Open WebUI)*
 
-## Step 1: Install Dependencies (First Time)
+---
 
-Open PowerShell:
+## Step 1: Install Dependencies *(First Time Only)*
 
 ```powershell
-# Clone the repo
-git clone https://github.com/yourusername/npu-windows.git
-cd npu-windows
-
-# Install Miniconda if needed
+# 1. Install Miniconda (if not installed)
 winget install Anaconda.Miniconda3
 
-# Restart PowerShell, then:
+# 2. Restart PowerShell, then create the environment
 conda create -n ipex-npu python=3.11 -y
 conda activate ipex-npu
+
+# 3. Install Intel NPU support
 pip install --pre --upgrade ipex-llm[npu]
-pip install fastapi uvicorn pydantic
+
+# 4. Install server dependencies
+pip install -r intel-npu-llm/requirements.txt
 ```
+
+---
+
+## Step 1b: HuggingFace Token *(Only for Llama Models)*
+
+Qwen, DeepSeek, MiniCPM, GLM-Edge, and Baichuan2 work **without** a token.
+Llama 2, Llama 3, and Llama 3.2 require accepting the license and a HF token.
+
+```powershell
+# Create the .env file with UTF-8 encoding (important!)
+'HF_TOKEN=hf_your_token_here' | Out-File -FilePath intel-npu-llm/.env -Encoding utf8
+```
+
+---
 
 ## Step 2: Start the Backend
 
@@ -33,68 +47,50 @@ pip install fastapi uvicorn pydantic
 .\start_backend.bat
 ```
 
-Wait for:
+Wait for the ready message:
 ```
-Detected CPU: Intel(R) Core(TM) Ultra 9 185H
-Processor: Intel Core Ultra Series 1 - Meteor Lake
-✓ qwen1.5-1.8b ready on Intel NPU!
+✓ 'qwen1.5-1.8b' ready on Intel NPU!
 Server starting on http://0.0.0.0:8000
 ```
 
-## Step 3: Start Open WebUI
+---
 
-In a new terminal:
+## Step 3: Open the Built-in UI
+
+Open your browser and go to: **http://localhost:8000**
+
+You'll see a full chat interface with:
+- Real-time NPU status (Idle / Busy)
+- Conversation history (multi-turn context)
+- Markdown rendering
+- Keyboard shortcuts (`Enter` to send, `Ctrl+L` to clear)
+
+---
+
+## Step 4: *(Optional)* Start Open WebUI
+
+For a more full-featured experience with plugins and user management:
+
 ```powershell
 cd intel-npu-llm
 docker compose up -d
 ```
 
-## Step 4: Chat!
-
-Open http://localhost:3000
-
-Select a model from the dropdown and start chatting. Check **Task Manager → NPU** to see it working!
+Then open **http://localhost:3000**
 
 ---
 
-## Using Your Own Open WebUI
-
-Already running Open WebUI elsewhere? Connect it to your NPU server:
-
-1. Go to **Settings → Connections → OpenAI API**
-2. Add a connection:
-   - **URL**: `http://<YOUR-WINDOWS-IP>:8000/v1`
-   - **Key**: `sk-dummy` (any value works)
-3. Save → NPU models appear in your model list!
-
-> **Find your IP**: Run `ipconfig` in PowerShell, look for your local IP (e.g., `192.168.1.x`)
-
----
-
-## Available Models
-
-Models verified compatible with ipex-llm NPU:
-
-| Model ID | Size | Speed | Best For |
-|----------|------|-------|----------|
-| `qwen1.5-1.8b` | 1.8B | ~8 tok/s | ✅ Default, fast |
-| `qwen1.5-4b` | 4B | ~5 tok/s | Better quality |
-| `qwen1.5-7b` | 7B | ~3 tok/s | Best Qwen |
-| `qwen2-1.5b` | 1.5B | ~10 tok/s | Fast |
-| `qwen2-7b` | 7B | ~3 tok/s | Officially supported |
-| `llama2-7b` | 7B | ~3 tok/s | Classic (needs HF login) |
-| `llama3-8b` | 8B | ~2 tok/s | Best Llama (needs HF login) |
-| `deepseek-1.5b` | 1.5B | ~10 tok/s | Reasoning |
-| `deepseek-7b` | 7B | ~3 tok/s | Best reasoning |
-
-## Loading Different Models
+## Common Options
 
 ```powershell
-# Load specific models
+# Load a specific model
+.\start_backend.bat --models "qwen2.5-3b"
+
+# Load multiple models (selectable from the UI dropdown)
 .\start_backend.bat --models "qwen1.5-1.8b,qwen1.5-4b"
 
-# Load multiple models
-.\start_backend.bat --models "qwen1.5-1.8b,deepseek-1.5b,qwen2-7b"
+# Use a different port
+.\start_backend.bat --port 8001
 
 # List all available models
 .\start_backend.bat --list
@@ -102,16 +98,46 @@ Models verified compatible with ipex-llm NPU:
 
 ---
 
-## Stopping
+## Connect to Remote Open WebUI / N8N
 
+If you have Open WebUI or N8N running elsewhere on your network:
+
+1. Find your Windows IP: run `ipconfig` in PowerShell
+2. Set the **API Base URL** to: `http://<YOUR-IP>:8000/v1`
+3. Set the **API Key** to: `sk-dummy` *(any value works)*
+
+> **Firewall note**: Allow port 8000 through Windows Firewall for remote access.
+
+---
+
+## Recommended Models
+
+| Model ID | Size | Speed | Notes |
+|---|---|---|---|
+| `qwen1.5-1.8b` | 1.8B | ~8 tok/s | ✅ Default — fast and reliable |
+| `qwen2.5-3b`   | 3B   | ~8 tok/s | 🔥 Best quality/speed balance |
+| `qwen2.5-7b`   | 7B   | ~3 tok/s | Best quality, needs more RAM |
+| `deepseek-1.5b`| 1.5B | ~10 tok/s | Reasoning tasks |
+| `llama3.2-1b`  | 1B   | ~15 tok/s | ⚡ Fastest (needs HF token) |
+
+> See [README.md](README.md) for the full model list with all options.
+
+---
+
+## Troubleshooting
+
+**Port already in use?**
 ```powershell
-# Stop backend: Ctrl+C in the terminal
-
-# Stop Open WebUI:
-cd intel-npu-llm
-docker compose down
+.\start_backend.bat --port 8001
+# or kill all Python processes:
+Get-Process python* | Stop-Process -Force
 ```
 
-## Next Steps
+**`.env` causes `ValueError: embedded null character`?**
+- Re-create it with `| Out-File -Encoding utf8` as shown in Step 1b above
+- Or open the file in Notepad → File > Save As → **Encoding: UTF-8**
 
-- See [README.md](README.md) for full documentation
+**NPU not detected?**
+1. Open Device Manager → Neural processors → should show "Intel(R) AI Boost"
+2. Update driver if missing
+3. For Meteor Lake (Series 1): ensure `IPEX_LLM_NPU_MTL=1` is set (the bat does this automatically)
