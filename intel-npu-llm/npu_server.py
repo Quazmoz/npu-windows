@@ -80,7 +80,8 @@ def load_models_config():
     config_path = Path(__file__).parent / "models.json"
     if config_path.exists():
         try:
-            with open(config_path, "r") as f:
+            # utf-8-sig handles both UTF-8 and UTF-8-with-BOM files (common Windows issue)
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except Exception as e:
             logger.error(f"Failed to load models.json: {e}")
@@ -654,16 +655,15 @@ async def chat_completions(request: ChatCompletionRequest):
         generated_text = ""
         retry_count = 0
         current_input_ids = input_ids
+        global is_generating  # Must be declared at function scope, not inside loops
         
         while retry_count <= MAX_RETRY_ATTEMPTS:
-            global is_generating
             async with npu_resource_lock:
                 is_generating = True
                 try:
                     with torch.no_grad():
-                        # Move to CPU context for token limit check if needed, but staying in executors for safety
                         output_ids = await asyncio.get_event_loop().run_in_executor(
-                            None, 
+                            None,
                             lambda: model.generate(current_input_ids, **gen_kwargs)
                         )
                 finally:
@@ -702,7 +702,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Calculate tokens
         prompt_tokens = input_length
-        completion_tokens = current_input_ids.shape[1] - prompt_tokens if retry_count == 0 else len(tokenizer.encode(generated_text)) 
+        completion_tokens = len(tokenizer.encode(generated_text))
         
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
@@ -865,10 +865,10 @@ async def system_status():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Intel NPU LLM Server")
     parser.add_argument(
-        "--models", 
-        type=str, 
-        default="qwen-1.8b",
-        help="Comma-separated list of models to load (e.g., 'qwen-1.8b,qwen2-1.5b,phi3-mini')"
+        "--models",
+        type=str,
+        default="qwen1.5-1.8b",
+        help="Comma-separated list of models to load (e.g., 'qwen1.5-1.8b,qwen2-1.5b,deepseek-1.5b')"
     )
     
     # Use PORT environment variable as default if available

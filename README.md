@@ -31,7 +31,9 @@ conda activate ipex-npu
 
 # Install ipex-llm with NPU support
 pip install --pre --upgrade ipex-llm[npu]
-pip install fastapi uvicorn pydantic
+
+# Install server dependencies
+pip install -r intel-npu-llm/requirements.txt
 ```
 
 ### 1b. HuggingFace Authentication (For Gated Models)
@@ -285,6 +287,15 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 # Kill existing Python processes
 Get-Process python* | Stop-Process -Force
 ```
+
+### .env File Encoding Error (`ValueError: embedded null character`)
+This happens when the `.env` file was saved in UTF-16 (the default for PowerShell's `>` redirect).
+
+**Fix**: Re-create the file using the UTF-8 safe command:
+```powershell
+'HF_TOKEN=hf_your_token_here' | Out-File -FilePath .env -Encoding utf8
+```
+Or open the file in Notepad → **File > Save As** → set **Encoding: UTF-8**.
 
 ---
 
