@@ -15,6 +15,11 @@ Run Large Language Models on your Intel Core Ultra NPU with an OpenAI-compatible
 - **Local & Private**: All processing happens on your device — nothing leaves your machine
 - **Power Efficient**: ~3-5x less power than CPU inference
 
+## 🎥 Demos
+
+- **Quick Overview & Speed Test**: [Intel NPU LLM - UI & Performance Demo](https://youtu.be/00RTemT1Bbs)
+- **Feature Deep Dive**: [Building with Intel NPU & OpenAI API](https://youtu.be/6F6LbR2Xjcg)
+
 ## 📋 Requirements
 
 - **Processor**: Intel Core Ultra (Meteor Lake, Arrow Lake, or Lunar Lake)
@@ -68,6 +73,8 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```powershell
 # From the project root - loads 2 models by default
 .\start_backend.bat
+
+> **Note**: `start_backend.bat` automatically detects your processor (Meteor Lake vs Arrow/Lunar Lake) and configures the `IPEX_LLM_NPU_MTL` variable for you.
 ```
 
 Or load specific models:
@@ -114,12 +121,13 @@ docker compose up -d
 
 #### Built-in Chat UI (No Docker Required)
 Open **http://localhost:8000** in your browser for a full-featured chat interface:
-- Real-time NPU status with animated indicators
+- Real-time NPU status with animated indicators (Connecting, Busy, Idle)
 - Model selector dropdown (loaded models populate automatically)
 - Conversation history with multi-turn context
 - Markdown rendering (code blocks, lists, bold/italic)
 - Keyboard shortcuts: `Enter` to send, `Shift+Enter` for newline, `Ctrl+L` to clear
-- Live token counter and system memory display
+- **Live Telemetry**: Real-time NPU busy state, system RAM usage, and model disk footprint (NPU + HuggingFace cache)
+- Live token counter for the entire session
 
 #### API Endpoints
 - `/` — Built-in Chat UI

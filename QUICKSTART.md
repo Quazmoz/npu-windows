@@ -2,6 +2,9 @@
 
 Get your Intel NPU running LLMs in under 10 minutes.
 
+- **🎥 Watch the Demo**: [Intel NPU LLM - Quick UI & Performance Overview](https://youtu.be/00RTemT1Bbs)
+- **📺 Full walkthrough**: [Building with Intel NPU & OpenAI API](https://youtu.be/6F6LbR2Xjcg)
+
 ## Prerequisites
 
 - Intel Core Ultra processor (Series 1 Meteor Lake, Series 2 Arrow Lake, or Lunar Lake)
