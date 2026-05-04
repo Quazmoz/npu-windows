@@ -107,6 +107,11 @@
             font-size: 15px; transition: all 0.2s; flex-shrink: 0;
         }
         .icon-btn:hover { background: var(--surface-3); border-color: var(--border-hover); color: var(--text-1); }
+        .icon-btn.danger:hover:not(:disabled) { color: #fecaca; border-color: rgba(239,68,68,0.45); }
+        .icon-btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
 
         /* ── CHAT AREA ───────────────────────────────────── */
         #chat-area {
@@ -332,7 +337,18 @@
                 </select>
                 <span class="model-arrow">▾</span>
             </div>
-            <button class="icon-btn" id="clear-btn" title="Clear conversation (Ctrl+L)">🗑</button>
+            <button class="icon-btn" id="load-model-btn" title="Load selected model" aria-label="Load selected model">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+            </button>
+            <button class="icon-btn" id="unload-model-btn" title="Unload selected model from memory" aria-label="Unload selected model from memory">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 21V9"/><path d="m7 14 5-5 5 5"/><path d="M5 3h14"/></svg>
+            </button>
+            <button class="icon-btn danger" id="delete-model-btn" title="Delete selected model from disk" aria-label="Delete selected model from disk">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+            </button>
+            <button class="icon-btn" id="new-chat-btn" title="Start new chat (Ctrl+L)" aria-label="Start new chat">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+            </button>
         </div>
     </header>
 
@@ -392,13 +408,16 @@
     const userInput    = document.getElementById('user-input');
     const sendBtn      = document.getElementById('send-btn');
     const modelSelect  = document.getElementById('model-select');
+    const loadModelBtn = document.getElementById('load-model-btn');
+    const unloadModelBtn = document.getElementById('unload-model-btn');
+    const deleteModelBtn = document.getElementById('delete-model-btn');
     const npuChip      = document.getElementById('npu-chip');
     const npuLabel     = document.getElementById('npu-label');
     const memChip      = document.getElementById('mem-chip');
     const memLabel     = document.getElementById('mem-label');
     const diskChip     = document.getElementById('disk-chip');
     const diskLabel    = document.getElementById('disk-label');
-    const clearBtn     = document.getElementById('clear-btn');
+    const newChatBtn   = document.getElementById('new-chat-btn');
     const modelStatus  = document.getElementById('model-status');
     const tokenCounter = document.getElementById('token-counter');
     sendBtn.disabled = true;  // disabled until models confirmed loaded
@@ -459,6 +478,9 @@
             modelStatus.className = '';
             userInput.placeholder = 'Loading models...';
             sendBtn.disabled = true;
+            loadModelBtn.disabled = true;
+            unloadModelBtn.disabled = true;
+            deleteModelBtn.disabled = true;
             return;
         }
 
@@ -473,18 +495,40 @@
         } else if (model.status === 'error') {
             modelStatus.textContent = `${model.name}: ${model.error || 'Load failed'}`;
             modelStatus.className = 'error';
-            userInput.placeholder = `Reload ${model.name} to try again`;
+            userInput.placeholder = `Click load to retry ${model.name}`;
         } else if (model.status === 'ready_to_load') {
             modelStatus.textContent = `${model.name} is cached and ready to load`;
             modelStatus.className = '';
-            userInput.placeholder = `Select ${model.name} to load it into the NPU runtime`;
+            userInput.placeholder = `Click load to bring ${model.name} into the NPU runtime`;
         } else {
             modelStatus.textContent = `${model.name} will download and prepare on first load`;
             modelStatus.className = '';
-            userInput.placeholder = `Select ${model.name} to download and load it locally`;
+            userInput.placeholder = `Click load to download and prepare ${model.name} locally`;
         }
 
         sendBtn.disabled = isGenerating || !model.is_loaded;
+        loadModelBtn.disabled = isGenerating || model.is_loaded || model.is_loading;
+        loadModelBtn.title = model.is_loaded
+            ? `${model.name} is already loaded`
+            : model.is_loading
+                ? `${model.name} is currently loading`
+                : `Load ${model.name}`;
+        unloadModelBtn.disabled = isGenerating || !model.can_unload;
+        unloadModelBtn.title = model.can_unload
+            ? `Unload ${model.name} from memory`
+            : model.is_loading
+                ? `Wait for ${model.name} to finish loading first`
+                : model.is_loaded
+                    ? `${model.name} is busy or unavailable for unload`
+                    : `${model.name} is not loaded`;
+        deleteModelBtn.disabled = isGenerating || !model.can_delete;
+        deleteModelBtn.title = model.can_delete
+            ? `Delete ${model.name} from local disk`
+            : model.is_loaded
+                ? `Restart without ${model.name} to delete it`
+                : model.is_loading
+                    ? `Wait for ${model.name} to finish loading first`
+                    : `No local cache to delete for ${model.name}`;
     }
 
     async function requestModelLoad(modelId, suppressToast = false) {
@@ -513,6 +557,64 @@
             modelStatus.textContent = `${model.name}: ${err.message}`;
             modelStatus.className = 'error';
             showToast(`Failed to start ${model.name}`);
+        }
+    }
+
+    async function requestModelUnload(modelId) {
+        const model = availableModels.get(modelId);
+        if (!model || !model.can_unload) {
+            updateModelUi();
+            return;
+        }
+
+        try {
+            const res = await fetch('/v1/models/unload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: modelId })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+            showToast(`${model.name} unloaded`);
+            if (modelSelect.value === modelId) waitingForModelId = null;
+            await updateStatus();
+        } catch (err) {
+            showToast(`Failed to unload ${model.name}`);
+            modelStatus.textContent = `${model.name}: ${err.message}`;
+            modelStatus.className = 'error';
+        }
+    }
+
+    async function requestModelDelete(modelId) {
+        const model = availableModels.get(modelId);
+        if (!model || !model.can_delete) {
+            updateModelUi();
+            return;
+        }
+
+        const confirmDelete = window.confirm(
+            `Delete local files for ${model.name}?\n\nThis removes its downloaded and compiled caches to free disk space.`
+        );
+        if (!confirmDelete) return;
+
+        try {
+            const res = await fetch('/v1/models/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: modelId })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+            const freedLabel = data.freed_gb > 0 ? `${data.freed_gb.toFixed(2)} GB freed` : 'No cache to remove';
+            showToast(`${model.name}: ${freedLabel}`);
+            waitingForModelId = null;
+            await updateStatus();
+        } catch (err) {
+            showToast(`Failed to delete ${model.name}`);
+            modelStatus.textContent = `${model.name}: ${err.message}`;
+            modelStatus.className = 'error';
         }
     }
 
@@ -636,9 +738,9 @@
         chatInner.innerHTML = '';
         chatInner.appendChild(emptyState);
         emptyState.classList.remove('hidden');
-        showToast('Conversation cleared');
+        showToast('New chat started');
     }
-    clearBtn.addEventListener('click', clearConversation);
+    newChatBtn.addEventListener('click', clearConversation);
 
     // ── Suggestions ───────────────────────────────────────
     function fillInput(el) {
@@ -673,10 +775,20 @@
     // ── Send ──────────────────────────────────────────────
     document.getElementById('chat-form').addEventListener('submit', sendMessage);
     sendBtn.addEventListener('click', sendMessage);
+    loadModelBtn.addEventListener('click', () => {
+        const model = getSelectedModelMeta();
+        if (model && !model.is_loaded && !model.is_loading) requestModelLoad(model.id);
+    });
+    unloadModelBtn.addEventListener('click', () => {
+        const model = getSelectedModelMeta();
+        if (model) requestModelUnload(model.id);
+    });
+    deleteModelBtn.addEventListener('click', () => {
+        const model = getSelectedModelMeta();
+        if (model) requestModelDelete(model.id);
+    });
     modelSelect.addEventListener('change', () => {
         updateModelUi();
-        const model = getSelectedModelMeta();
-        if (model && !model.is_loaded) requestModelLoad(model.id);
     });
 
     async function sendMessage() {

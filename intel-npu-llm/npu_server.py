@@ -21,6 +21,8 @@ import logging
 import psutil
 import re
 import contextlib
+import shutil
+import gc
 from pathlib import Path
 from threading import Thread
 from contextlib import asynccontextmanager
@@ -127,6 +129,11 @@ def get_npu_cache_dir(hf_model_path: str) -> Path:
     return Path(NPU_MODEL_CACHE) / hf_model_path.replace("/", "_")
 
 
+def get_hf_repo_dir(hf_model_path: str) -> Path:
+    """Return the Hugging Face repo cache directory for a model."""
+    return Path(get_hf_home_dir()) / "hub" / f"models--{hf_model_path.replace('/', '--')}"
+
+
 def has_npu_cache(hf_model_path: str) -> bool:
     """Return True if an NPU-compiled cache exists for a model."""
     cache_dir = get_npu_cache_dir(hf_model_path)
@@ -138,12 +145,54 @@ def has_npu_cache(hf_model_path: str) -> bool:
 
 def has_hf_cache(hf_model_path: str) -> bool:
     """Return True if the Hugging Face hub already has cached snapshots for a model."""
-    repo_dir = Path(get_hf_home_dir()) / "hub" / f"models--{hf_model_path.replace('/', '--')}"
+    repo_dir = get_hf_repo_dir(hf_model_path)
     snapshots_dir = repo_dir / "snapshots"
     try:
         return snapshots_dir.exists() and any(snapshots_dir.iterdir())
     except OSError:
         return False
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Return total size of a directory or file in bytes."""
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+        return total
+    except OSError:
+        return 0
+
+
+def _ensure_within_root(path: Path, root: Path) -> tuple[Path, Path]:
+    """Resolve a path and ensure it remains inside the intended root."""
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+        raise ValueError(f"Refusing to operate outside {resolved_root}")
+    return resolved_path, resolved_root
+
+
+def _delete_path_if_exists(path: Path, root: Path) -> int:
+    """Delete a file or directory if it exists and return freed bytes."""
+    if not path.exists():
+        return 0
+
+    resolved_path, _ = _ensure_within_root(path, root)
+    freed_bytes = _dir_size_bytes(resolved_path)
+
+    if resolved_path.is_dir():
+        shutil.rmtree(resolved_path)
+    else:
+        resolved_path.unlink()
+
+    return freed_bytes
 
 
 def set_model_status(model_id: str, status: str, phase: Optional[str] = None, error: Optional[str] = None) -> None:
@@ -159,6 +208,25 @@ def set_model_status(model_id: str, status: str, phase: Optional[str] = None, er
 def clear_model_status(model_id: str) -> None:
     """Clear any transient status override for a model."""
     model_status_overrides.pop(model_id, None)
+
+
+def unload_model_from_memory(model_id: str) -> bool:
+    """Unload a loaded model from memory without deleting on-disk caches."""
+    model_bundle = loaded_models.pop(model_id, None)
+    model_locks.pop(model_id, None)
+    clear_model_status(model_id)
+
+    if not model_bundle:
+        return False
+
+    try:
+        del model_bundle["model"]
+        del model_bundle["tokenizer"]
+    except Exception:
+        pass
+
+    gc.collect()
+    return True
 
 
 def get_model_status_label(status: str, phase: Optional[str] = None) -> str:
@@ -221,6 +289,8 @@ def get_model_catalog_entry(model_id: str) -> Dict[str, Any]:
         "is_downloaded": compiled_cached or hf_cached,
         "has_npu_cache": compiled_cached,
         "has_hf_cache": hf_cached,
+        "can_unload": model_id in loaded_models and not task_running and not (model_locks.get(model_id).locked() if model_id in model_locks else False),
+        "can_delete": model_id not in loaded_models and status not in {"queued", "loading"} and (compiled_cached or hf_cached),
         "error": override.get("error"),
     }
 
@@ -365,6 +435,13 @@ class StreamOptions(BaseModel):
     include_usage: Optional[bool] = None
 
 class ModelLoadRequest(BaseModel):
+    model: str
+
+
+class ModelDeleteRequest(BaseModel):
+    model: str
+
+class ModelUnloadRequest(BaseModel):
     model: str
 
 class ChatCompletionRequest(BaseModel):
@@ -1241,6 +1318,106 @@ async def load_model(request: ModelLoadRequest):
         "message": f"Loading {model_entry['name']} locally. This can take a while on first run.",
         "model": model_entry
     }
+
+
+@app.post("/v1/models/unload")
+async def unload_model(request: ModelUnloadRequest):
+    """Unload a specific model from memory while keeping local disk caches."""
+    if request.model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{request.model}'")
+
+    if request.model not in loaded_models:
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is not currently loaded")
+
+    task = model_load_tasks.get(request.model)
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is still loading")
+
+    model_lock = model_locks.get(request.model)
+    if model_lock and model_lock.locked():
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is busy and cannot be unloaded right now")
+
+    unloaded = unload_model_from_memory(request.model)
+    model_entry = get_model_catalog_entry(request.model)
+
+    if not unloaded:
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is not currently loaded")
+
+    return {
+        "status": "unloaded",
+        "message": f"Unloaded {model_entry['name']} from memory.",
+        "model": model_entry
+    }
+
+
+@app.post("/v1/models/delete")
+async def delete_model(request: ModelDeleteRequest):
+    """Delete cached artifacts for a specific model from local disk."""
+    if request.model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{request.model}'")
+
+    if request.model in loaded_models:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Model '{request.model}' is currently loaded. Restart the server without it before deleting."
+        )
+
+    task = model_load_tasks.get(request.model)
+    if task and not task.done():
+        raise HTTPException(status_code=409, detail=f"Model '{request.model}' is still loading")
+
+    model_info = AVAILABLE_MODELS[request.model]
+    hf_id = model_info["hf_id"]
+    npu_cache_dir = get_npu_cache_dir(hf_id)
+    hf_repo_dir = get_hf_repo_dir(hf_id)
+
+    try:
+        freed_bytes = 0
+        deleted_npu_cache = False
+        deleted_hf_cache = False
+
+        if npu_cache_dir.exists():
+            freed_bytes += _delete_path_if_exists(npu_cache_dir, Path(NPU_MODEL_CACHE))
+            deleted_npu_cache = True
+
+        if hf_repo_dir.exists():
+            freed_bytes += _delete_path_if_exists(hf_repo_dir, Path(get_hf_home_dir()) / "hub")
+            deleted_hf_cache = True
+
+        clear_model_status(request.model)
+        model_load_tasks.pop(request.model, None)
+
+        model_entry = get_model_catalog_entry(request.model)
+        if not deleted_npu_cache and not deleted_hf_cache:
+            return {
+                "status": "noop",
+                "message": f"No local cache was found for {model_entry['name']}.",
+                "freed_bytes": 0,
+                "freed_gb": 0.0,
+                "deleted": {
+                    "npu_cache": False,
+                    "hf_cache": False,
+                },
+                "model": model_entry
+            }
+
+        freed_gb = round(freed_bytes / (1024 ** 3), 2)
+        return {
+            "status": "deleted",
+            "message": f"Deleted local cache for {model_entry['name']}.",
+            "freed_bytes": freed_bytes,
+            "freed_gb": freed_gb,
+            "deleted": {
+                "npu_cache": deleted_npu_cache,
+                "hf_cache": deleted_hf_cache,
+            },
+            "model": model_entry
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Failed to delete model '{request.model}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model '{request.model}'")
 
 @app.get("/health")
 async def health():
