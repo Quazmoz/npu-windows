@@ -108,18 +108,184 @@ loaded_models: Dict[str, Any] = {}
 default_model_id = "qwen1.5-1.8b"  # Use the verified working model
 npu_resource_lock = asyncio.Lock()  # Fallback shared lock for safety
 model_locks: Dict[str, asyncio.Lock] = {}
+model_load_tasks: Dict[str, asyncio.Task] = {}
+model_status_overrides: Dict[str, Dict[str, Any]] = {}
+model_load_lock = asyncio.Lock()
 is_generating = False  # Explicit state for tracking
 models_ready = asyncio.Event()
 model_ids_to_load: List[str] = []
 model_loader_task: Optional[asyncio.Task] = None
 
 
+def get_hf_home_dir() -> str:
+    """Return the Hugging Face cache home directory."""
+    return os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+
+
+def get_npu_cache_dir(hf_model_path: str) -> Path:
+    """Return the compiled NPU cache directory for a model."""
+    return Path(NPU_MODEL_CACHE) / hf_model_path.replace("/", "_")
+
+
+def has_npu_cache(hf_model_path: str) -> bool:
+    """Return True if an NPU-compiled cache exists for a model."""
+    cache_dir = get_npu_cache_dir(hf_model_path)
+    try:
+        return cache_dir.exists() and any(cache_dir.iterdir())
+    except OSError:
+        return False
+
+
+def has_hf_cache(hf_model_path: str) -> bool:
+    """Return True if the Hugging Face hub already has cached snapshots for a model."""
+    repo_dir = Path(get_hf_home_dir()) / "hub" / f"models--{hf_model_path.replace('/', '--')}"
+    snapshots_dir = repo_dir / "snapshots"
+    try:
+        return snapshots_dir.exists() and any(snapshots_dir.iterdir())
+    except OSError:
+        return False
+
+
+def set_model_status(model_id: str, status: str, phase: Optional[str] = None, error: Optional[str] = None) -> None:
+    """Persist a transient model status used by the UI while loading."""
+    model_status_overrides[model_id] = {
+        "status": status,
+        "phase": phase,
+        "error": error,
+        "updated_at": int(time.time())
+    }
+
+
+def clear_model_status(model_id: str) -> None:
+    """Clear any transient status override for a model."""
+    model_status_overrides.pop(model_id, None)
+
+
+def get_model_status_label(status: str, phase: Optional[str] = None) -> str:
+    """Return a human-readable label for a model state."""
+    if status == "loaded":
+        return "Loaded"
+    if status == "queued":
+        return "Queued..."
+    if status == "loading":
+        phase_labels = {
+            "download": "Downloading...",
+            "prepare_cache": "Preparing NPU cache...",
+            "load_cache": "Loading cached model...",
+        }
+        return phase_labels.get(phase, "Loading...")
+    if status == "ready_to_load":
+        return "Ready to load"
+    if status == "not_downloaded":
+        return "Download required"
+    if status == "error":
+        return "Load failed"
+    return "Unknown"
+
+
+def get_model_catalog_entry(model_id: str) -> Dict[str, Any]:
+    """Return UI-friendly status metadata for a model."""
+    model_info = AVAILABLE_MODELS.get(model_id, {})
+    hf_id = model_info.get("hf_id", "")
+    override = model_status_overrides.get(model_id, {})
+    task = model_load_tasks.get(model_id)
+    task_running = bool(task and not task.done())
+    compiled_cached = bool(hf_id and has_npu_cache(hf_id))
+    hf_cached = bool(hf_id and has_hf_cache(hf_id))
+
+    if model_id in loaded_models:
+        status = "loaded"
+        phase = None
+    elif override.get("status") == "error":
+        status = "error"
+        phase = override.get("phase")
+    elif task_running:
+        status = override.get("status", "loading")
+        phase = override.get("phase")
+    elif compiled_cached or hf_cached:
+        status = "ready_to_load"
+        phase = None
+    else:
+        status = "not_downloaded"
+        phase = None
+
+    return {
+        "id": model_id,
+        "name": model_info.get("name", model_id),
+        "description": model_info.get("description", ""),
+        "status": status,
+        "status_label": get_model_status_label(status, phase),
+        "phase": phase,
+        "is_loaded": model_id in loaded_models,
+        "is_loading": status in {"queued", "loading"},
+        "is_downloaded": compiled_cached or hf_cached,
+        "has_npu_cache": compiled_cached,
+        "has_hf_cache": hf_cached,
+        "error": override.get("error"),
+    }
+
+
+async def _load_single_model_task(model_id: str) -> None:
+    """Load one model in the background, serializing heavy model work."""
+    model_info = AVAILABLE_MODELS[model_id]
+    hf_id = model_info["hf_id"]
+
+    try:
+        async with model_load_lock:
+            if model_id in loaded_models:
+                clear_model_status(model_id)
+                return
+
+            if has_npu_cache(hf_id):
+                set_model_status(model_id, "loading", phase="load_cache")
+            elif has_hf_cache(hf_id):
+                set_model_status(model_id, "loading", phase="prepare_cache")
+            else:
+                set_model_status(model_id, "loading", phase="download")
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, load_npu_model, model_id, hf_id)
+            clear_model_status(model_id)
+    except Exception as e:
+        loaded_models.pop(model_id, None)
+        model_locks.pop(model_id, None)
+        set_model_status(model_id, "error", phase="error", error=str(e))
+        logger.exception(f"Failed to load model '{model_id}': {e}")
+
+
+def schedule_model_load(model_id: str) -> Optional[asyncio.Task]:
+    """Schedule a background load for a model if needed."""
+    if model_id not in AVAILABLE_MODELS:
+        logger.warning(f"Unknown model '{model_id}', skipping.")
+        return None
+
+    if model_id in loaded_models:
+        clear_model_status(model_id)
+        return None
+
+    existing_task = model_load_tasks.get(model_id)
+    if existing_task and not existing_task.done():
+        return existing_task
+
+    set_model_status(model_id, "queued", phase="queued")
+    task = asyncio.create_task(_load_single_model_task(model_id))
+    model_load_tasks[model_id] = task
+    return task
+
+
 async def _load_models_in_background() -> None:
     """Load configured models without blocking request handling."""
-    loop = asyncio.get_running_loop()
     loaded_models.clear()
     model_locks.clear()
-    await loop.run_in_executor(None, load_all_models, model_ids_to_load)
+    model_load_tasks.clear()
+    model_status_overrides.clear()
+
+    startup_tasks = [schedule_model_load(model_id) for model_id in model_ids_to_load]
+    startup_tasks = [task for task in startup_tasks if task is not None]
+
+    if startup_tasks:
+        await asyncio.gather(*startup_tasks, return_exceptions=True)
+
     models_ready.set()
     logger.info("All models loaded. Server ready.")
 
@@ -138,8 +304,15 @@ async def lifespan(app: FastAPI):
             model_loader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await model_loader_task
+        for task in list(model_load_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         loaded_models.clear()
         model_locks.clear()
+        model_load_tasks.clear()
+        model_status_overrides.clear()
         models_ready.clear()
         logger.info("Models unloaded.")
 
@@ -150,7 +323,14 @@ app = FastAPI(title="Intel NPU LLM Server", lifespan=lifespan)
 @app.get("/", response_class=FileResponse)
 async def read_index():
     """Serve the built-in test UI."""
-    return FileResponse(Path(__file__).parent / "index.html")
+    return FileResponse(
+        Path(__file__).parent / "index.html",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 # --- NPU Model Cache Directory ---
 NPU_MODEL_CACHE = os.path.join(os.path.dirname(__file__), "npu_model_cache")
@@ -183,6 +363,9 @@ class ToolCall(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = None
+
+class ModelLoadRequest(BaseModel):
+    model: str
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -259,7 +442,7 @@ def load_npu_model(model_id: str, hf_model_path: str):
     logger.info(f"NPU Environment: IPEX_LLM_NPU_MTL={npu_env}")
     
     # Create cache directory for NPU model
-    model_cache_dir = os.path.join(NPU_MODEL_CACHE, hf_model_path.replace("/", "_"))
+    model_cache_dir = str(get_npu_cache_dir(hf_model_path))
     
     if not os.path.exists(model_cache_dir):
         # Create parent directories and convert model
@@ -315,6 +498,12 @@ def get_model_and_tokenizer(model_id: str):
     # Try exact match
     if model_id in loaded_models:
         return loaded_models[model_id]["model"], loaded_models[model_id]["tokenizer"]
+
+    if model_id in AVAILABLE_MODELS:
+        model_entry = get_model_catalog_entry(model_id)
+        if model_entry["is_loading"]:
+            raise HTTPException(status_code=409, detail=f"Model '{model_id}' is still loading")
+        raise HTTPException(status_code=409, detail=f"Model '{model_id}' is not loaded yet")
     
     # Fallback to default
     if default_model_id in loaded_models:
@@ -1030,6 +1219,29 @@ async def list_models():
     
     return {"object": "list", "data": models_list}
 
+
+@app.post("/v1/models/load")
+async def load_model(request: ModelLoadRequest):
+    """Queue a model for local download/compile/load if needed."""
+    if request.model not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Unknown model '{request.model}'")
+
+    task = schedule_model_load(request.model)
+    model_entry = get_model_catalog_entry(request.model)
+
+    if task is None and model_entry["is_loaded"]:
+        return {
+            "status": "loaded",
+            "message": f"{model_entry['name']} is already ready.",
+            "model": model_entry
+        }
+
+    return {
+        "status": model_entry["status"],
+        "message": f"Loading {model_entry['name']} locally. This can take a while on first run.",
+        "model": model_entry
+    }
+
 @app.get("/health")
 async def health():
     if not models_ready.is_set():
@@ -1058,9 +1270,11 @@ async def system_status():
 
     # Disk sizes
     npu_cache_gb = _dir_size_gb(NPU_MODEL_CACHE)
-    hf_home = os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+    hf_home = get_hf_home_dir()
     hf_hub_path = os.path.join(hf_home, "hub")
     hf_cache_gb = _dir_size_gb(hf_hub_path)
+    available_models = [get_model_catalog_entry(model_id) for model_id in AVAILABLE_MODELS]
+    loading_count = sum(1 for model in available_models if model["is_loading"])
 
     return {
         "memory": {
@@ -1073,7 +1287,9 @@ async def system_status():
         },
         "models": {
             "loaded": list(loaded_models.keys()),
-            "count": len(loaded_models)
+            "count": len(loaded_models),
+            "loading_count": loading_count,
+            "available": available_models
         },
         "npu": {
             "config": os.environ.get("IPEX_LLM_NPU_MTL", "non-MTL"),

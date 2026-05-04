@@ -33,7 +33,7 @@ echo Detected CPU: !CPU_NAME!
 
 REM Check for Meteor Lake (Series 1) by looking for "1" followed by two digits and H/U
 REM Examples: 185H, 165H, 155H, 125U
-echo !CPU_NAME! | findstr /r "1[0-9][0-9][HU]" >nul
+echo !CPU_NAME! | findstr /r "Ultra.*1[0-9][0-9][HU]" >nul
 if !errorlevel!==0 (
     echo Processor: Intel Core Ultra Series 1 - Meteor Lake
     set IPEX_LLM_NPU_MTL=1
@@ -83,16 +83,39 @@ if errorlevel 1 (
 echo Conda: !CONDA_PATH! [ipex-npu]
 echo.
 
-REM ---- Ensure dependencies are installed ----
-echo Checking dependencies...
-pip install -r "%~dp0intel-npu-llm\requirements.txt" --quiet
-if errorlevel 1 (
-    echo WARNING: Some dependencies may be missing. If the server fails to start,
-    echo run: pip install -r intel-npu-llm\requirements.txt
+if not exist "%~dp0.deps_installed" (
+    echo Installing dependencies ^(first run only^)...
+    pip install -r "%~dp0intel-npu-llm\requirements.txt"
+    if errorlevel 1 (
+        echo ERROR: Failed to install dependencies.
+        pause
+        exit /b 1
+    )
+    echo. > "%~dp0.deps_installed"
+    echo Dependencies installed.
+) else (
+    echo Dependencies: OK ^(cached^)
 )
 echo.
 
 cd /d "%~dp0intel-npu-llm"
+
+REM ---- Check port availability ----
+set PORT=8000
+for %%A in (%*) do (
+    if "%%A"=="--port" set NEXT_IS_PORT=1
+    if defined NEXT_IS_PORT if not "%%A"=="--port" (
+        set PORT=%%A
+        set NEXT_IS_PORT=
+    )
+)
+netstat -ano 2>nul | findstr /r /c:":%PORT% .*LISTENING" >nul
+if !errorlevel!==0 (
+    echo ERROR: Port !PORT! is already in use.
+    echo Stop the process using that port or pass --port XXXX to use a different one.
+    pause
+    exit /b 1
+)
 
 REM ---- Start server ----
 if "%~1"=="" (
