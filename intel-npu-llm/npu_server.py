@@ -19,8 +19,11 @@ import asyncio
 import os
 import logging
 import psutil
+import re
+import contextlib
 from pathlib import Path
 from threading import Thread
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
@@ -67,13 +70,6 @@ else:
 from ipex_llm.transformers.npu_model import AutoModelForCausalLM
 from transformers import AutoTokenizer, TextIteratorStreamer
 
-app = FastAPI(title="Intel NPU LLM Server")
-
-@app.get("/", response_class=FileResponse)
-async def read_index():
-    """Serve the built-in test UI."""
-    return FileResponse(Path(__file__).parent / "index.html")
-
 # --- Available Models Configuration ---
 def load_models_config():
     """Load model definitions from models.json."""
@@ -89,11 +85,64 @@ def load_models_config():
 
 AVAILABLE_MODELS = load_models_config()
 
+# Module-level defaults (override per model in models.json via "max_context_len" / "max_prompt_len")
+DEFAULT_MAX_CONTEXT_LEN = 1024
+DEFAULT_MAX_PROMPT_LEN = 512
+
+
+def get_model_context_limits(model_id: str) -> tuple[int, int]:
+    """Return (max_context_len, max_prompt_len) for a given model."""
+    model_cfg = AVAILABLE_MODELS.get(model_id, {})
+    return (
+        model_cfg.get("max_context_len", DEFAULT_MAX_CONTEXT_LEN),
+        model_cfg.get("max_prompt_len", DEFAULT_MAX_PROMPT_LEN),
+    )
+
 # --- Global State ---
 loaded_models: Dict[str, Any] = {}
 default_model_id = "qwen1.5-1.8b"  # Use the verified working model
 npu_resource_lock = asyncio.Lock()  # Ensure only one generation at a time
 is_generating = False  # Explicit state for tracking
+models_ready = asyncio.Event()
+model_ids_to_load: List[str] = []
+model_loader_task: Optional[asyncio.Task] = None
+
+
+async def _load_models_in_background() -> None:
+    """Load configured models without blocking request handling."""
+    loop = asyncio.get_running_loop()
+    loaded_models.clear()
+    await loop.run_in_executor(None, load_all_models, model_ids_to_load)
+    models_ready.set()
+    logger.info("All models loaded. Server ready.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model_loader_task
+
+    models_ready.clear()
+    model_loader_task = asyncio.create_task(_load_models_in_background())
+
+    try:
+        yield
+    finally:
+        if model_loader_task and not model_loader_task.done():
+            model_loader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await model_loader_task
+        loaded_models.clear()
+        models_ready.clear()
+        logger.info("Models unloaded.")
+
+
+app = FastAPI(title="Intel NPU LLM Server", lifespan=lifespan)
+
+
+@app.get("/", response_class=FileResponse)
+async def read_index():
+    """Serve the built-in test UI."""
+    return FileResponse(Path(__file__).parent / "index.html")
 
 # --- NPU Model Cache Directory ---
 NPU_MODEL_CACHE = os.path.join(os.path.dirname(__file__), "npu_model_cache")
@@ -194,6 +243,7 @@ class ResponseObject(BaseModel):
 def load_npu_model(model_id: str, hf_model_path: str):
     """Load a single model with NPU optimization."""
     global loaded_models
+    max_context_len, max_prompt_len = get_model_context_limits(model_id)
     
     logger.info(f"Loading '{model_id}' ({hf_model_path}) for Intel NPU...")
     
@@ -215,8 +265,8 @@ def load_npu_model(model_id: str, hf_model_path: str):
             attn_implementation="eager",
             load_in_low_bit="sym_int4",
             optimize_model=True,
-            max_context_len=1024,
-            max_prompt_len=512,
+            max_context_len=max_context_len,
+            max_prompt_len=max_prompt_len,
             save_directory=model_cache_dir
         )
         tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
@@ -342,8 +392,6 @@ def parse_tool_calls(text: str, available_tools: List[ToolDefinition] = None) ->
     
     Returns (remaining_text, list_of_tool_calls).
     """
-    import re
-    
     tool_calls = []
     seen_calls = set()  # For deduplication
     remaining_text = text
@@ -472,10 +520,8 @@ Output ONLY valid JSON in this format:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     model, tokenizer = get_model_and_tokenizer(request.model)
+    max_context_len, max_prompt_len = get_model_context_limits(request.model)
     
-    # NPU model context limits (set during compilation)
-    MAX_CONTEXT_LEN = 1024
-    MAX_PROMPT_LEN = 512
     MAX_RETRY_ATTEMPTS = 2  # For malformed tool calls
     
     # Check if tools are disabled via tool_choice
@@ -527,14 +573,14 @@ async def chat_completions(request: ChatCompletionRequest):
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     input_length = input_ids.shape[1]
     
-    # Truncate input if too long (keep last MAX_PROMPT_LEN tokens)
-    if input_length > MAX_PROMPT_LEN:
-        input_ids = input_ids[:, -MAX_PROMPT_LEN:]
-        input_length = MAX_PROMPT_LEN
-        logger.warning(f"Input truncated to {MAX_PROMPT_LEN} tokens")
+    # Truncate input if too long (keep last max_prompt_len tokens)
+    if input_length > max_prompt_len:
+        input_ids = input_ids[:, -max_prompt_len:]
+        input_length = max_prompt_len
+        logger.warning(f"Input truncated to {max_prompt_len} tokens")
     
     # Cap max_new_tokens to stay within context limit
-    available_tokens = MAX_CONTEXT_LEN - input_length - 10
+    available_tokens = max_context_len - input_length - 10
     max_new_tokens = min(request.max_tokens or 512, available_tokens, 500)
     max_new_tokens = max(max_new_tokens, 10)
     
@@ -555,7 +601,7 @@ async def chat_completions(request: ChatCompletionRequest):
             async with npu_resource_lock:
                 is_generating = True
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, lambda: model.generate(input_ids, **gen_kwargs))
+                    await asyncio.get_running_loop().run_in_executor(None, lambda: model.generate(input_ids, **gen_kwargs))
                 except Exception as e:
                     logger.error(f"Generation failed: {e}")
                 finally:
@@ -567,55 +613,66 @@ async def chat_completions(request: ChatCompletionRequest):
         async def stream_generator():
             request_id = f"chatcmpl-{uuid.uuid4()}"
             accumulated_text = ""
-            tool_calls_emitted = False
+            buffered_chunks: List[str] = []
             
             for text in streamer:
                 accumulated_text += text
-                
-                # Check if we should parse tool calls (at the end)
-                # For now, stream content normally
-                chunk = {
+                buffered_chunks.append(text)
+            
+            finish_reason = "stop"
+            _, parsed_tools = (accumulated_text, [])
+            if use_tools:
+                _, parsed_tools = parse_tool_calls(accumulated_text, request.tools)
+
+            if parsed_tools:
+                finish_reason = "tool_calls"
+
+                initial_chunk = {
                     "id": request_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": request.model,
-                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": None},
+                        "finish_reason": None
+                    }]
                 }
-                # When stream_options.include_usage is true, exclude usage from normal chunks
-                if request.stream_options and request.stream_options.include_usage:
-                    pass # Don't add usage to normal chunks
-                yield f"data: {json.dumps(chunk)}\n\n"
-            
-            # At the end, check if we detected tool calls
-            finish_reason = "stop"
-            if use_tools:
-                _, parsed_tools = parse_tool_calls(accumulated_text, request.tools)
-                if parsed_tools:
-                    finish_reason = "tool_calls"
-                    # Emit tool calls as final chunks
-                    for i, tc in enumerate(parsed_tools):
-                        tool_chunk = {
-                            "id": request_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": request.model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [{
-                                        "index": i,
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": tc.function.name,
-                                            "arguments": tc.function.arguments
-                                        }
-                                    }]
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(tool_chunk)}\n\n"
+                yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+                for i, tc in enumerate(parsed_tools):
+                    tool_chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": i,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                }]
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(tool_chunk)}\n\n"
+            else:
+                for text in buffered_chunks:
+                    chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
             
             # Calculate completion tokens unconditionally
             completion_tokens = len(tokenizer.encode(accumulated_text))
@@ -662,7 +719,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 is_generating = True
                 try:
                     with torch.no_grad():
-                        output_ids = await asyncio.get_event_loop().run_in_executor(
+                        output_ids = await asyncio.get_running_loop().run_in_executor(
                             None,
                             lambda: model.generate(current_input_ids, **gen_kwargs)
                         )
@@ -682,8 +739,8 @@ async def chat_completions(request: ChatCompletionRequest):
                     retry_prompt += "<|im_start|>assistant\n"
                     current_input_ids = tokenizer.encode(retry_prompt, return_tensors="pt")
                     # Re-truncate if needed
-                    if current_input_ids.shape[1] > MAX_PROMPT_LEN:
-                        current_input_ids = current_input_ids[:, -MAX_PROMPT_LEN:]
+                    if current_input_ids.shape[1] > max_prompt_len:
+                        current_input_ids = current_input_ids[:, -max_prompt_len:]
                     continue
             break
         
@@ -702,7 +759,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # Calculate tokens
         prompt_tokens = input_length
-        completion_tokens = len(tokenizer.encode(generated_text))
+        completion_tokens = int(output_ids.shape[1] - current_input_ids.shape[1])
         
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
@@ -733,10 +790,7 @@ async def create_response(request: ResponseRequest):
     Converts Responses API format to internal format and returns response.
     """
     model, tokenizer = get_model_and_tokenizer(request.model)
-    
-    # NPU model context limits
-    MAX_CONTEXT_LEN = 1024
-    MAX_PROMPT_LEN = 512
+    max_context_len, max_prompt_len = get_model_context_limits(request.model)
     
     # Convert input to prompt
     # Input can be a string or a list of messages
@@ -766,13 +820,13 @@ async def create_response(request: ResponseRequest):
     input_length = input_ids.shape[1]
     
     # Truncate if too long
-    if input_length > MAX_PROMPT_LEN:
-        input_ids = input_ids[:, -MAX_PROMPT_LEN:]
-        input_length = MAX_PROMPT_LEN
-        logger.warning(f"Input truncated to {MAX_PROMPT_LEN} tokens")
+    if input_length > max_prompt_len:
+        input_ids = input_ids[:, -max_prompt_len:]
+        input_length = max_prompt_len
+        logger.warning(f"Input truncated to {max_prompt_len} tokens")
     
     # Cap max tokens
-    available_tokens = MAX_CONTEXT_LEN - input_length - 10
+    available_tokens = max_context_len - input_length - 10
     max_new_tokens = min(request.max_output_tokens or 512, available_tokens, 500)
     max_new_tokens = max(max_new_tokens, 10)
     
@@ -789,7 +843,7 @@ async def create_response(request: ResponseRequest):
         is_generating = True
         try:
             with torch.no_grad():
-                output_ids = await asyncio.get_event_loop().run_in_executor(
+                output_ids = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: model.generate(input_ids, **gen_kwargs)
                 )
@@ -797,6 +851,7 @@ async def create_response(request: ResponseRequest):
             is_generating = False
     
     generated_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
+    completion_tokens = int(output_ids.shape[1] - input_ids.shape[1])
     
     # Build Responses API format response
     response_id = f"resp-{uuid.uuid4()}"
@@ -833,11 +888,9 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok", 
-        "models_loaded": len(loaded_models),
-        "npu_lock_status": "locked" if npu_resource_lock.locked() else "free"
-    }
+    if not models_ready.is_set():
+        return {"status": "loading", "models_loaded": 0}
+    return {"status": "ok"}
 
 def _dir_size_gb(path: str) -> float:
     """Return total size of a directory in GB, or 0.0 if it doesn't exist."""
@@ -915,13 +968,10 @@ if __name__ == "__main__":
         exit(0)
     
     # Parse model list
-    model_ids = [m.strip() for m in args.models.split(",")]
-    
-    # Load models
-    load_all_models(model_ids)
-    
+    model_ids_to_load = [m.strip() for m in args.models.split(",") if m.strip()]
+
     logger.info(f"Server starting! Visit: http://localhost:{args.port}")
-    logger.info(f"Models available: {', '.join(loaded_models.keys())}")
+    logger.info(f"Models requested: {', '.join(model_ids_to_load)}")
     
     # Bind to all interfaces (0.0.0.0) but uvicorn will still log 0.0.0.0 by default.
     # To avoid confusing the user, we print a clear URL above.
