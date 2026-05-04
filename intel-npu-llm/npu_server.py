@@ -98,10 +98,16 @@ def get_model_context_limits(model_id: str) -> tuple[int, int]:
         model_cfg.get("max_prompt_len", DEFAULT_MAX_PROMPT_LEN),
     )
 
+
+def get_model_lock(model_id: str) -> asyncio.Lock:
+    """Return the asyncio lock for a given model, falling back to a shared lock."""
+    return model_locks.get(model_id, npu_resource_lock)
+
 # --- Global State ---
 loaded_models: Dict[str, Any] = {}
 default_model_id = "qwen1.5-1.8b"  # Use the verified working model
-npu_resource_lock = asyncio.Lock()  # Ensure only one generation at a time
+npu_resource_lock = asyncio.Lock()  # Fallback shared lock for safety
+model_locks: Dict[str, asyncio.Lock] = {}
 is_generating = False  # Explicit state for tracking
 models_ready = asyncio.Event()
 model_ids_to_load: List[str] = []
@@ -112,6 +118,7 @@ async def _load_models_in_background() -> None:
     """Load configured models without blocking request handling."""
     loop = asyncio.get_running_loop()
     loaded_models.clear()
+    model_locks.clear()
     await loop.run_in_executor(None, load_all_models, model_ids_to_load)
     models_ready.set()
     logger.info("All models loaded. Server ready.")
@@ -132,6 +139,7 @@ async def lifespan(app: FastAPI):
             with contextlib.suppress(asyncio.CancelledError):
                 await model_loader_task
         loaded_models.clear()
+        model_locks.clear()
         models_ready.clear()
         logger.info("Models unloaded.")
 
@@ -286,6 +294,7 @@ def load_npu_model(model_id: str, hf_model_path: str):
         "tokenizer": tokenizer,
         "hf_id": hf_model_path
     }
+    model_locks[model_id] = asyncio.Lock()
     logger.info(f" ✓ '{model_id}' ready on Intel NPU!")
 
 def load_all_models(model_ids: List[str]):
@@ -516,6 +525,176 @@ Output ONLY valid JSON in this format:
 {"name": "function_name", "arguments": {"param": "value"}}"""
 
 
+def _format_chatml_message(message: ChatMessage) -> str:
+    """Format a single message into a ChatML block."""
+    content = message.content or ""
+
+    if message.role == "tool" and message.tool_call_id:
+        return (
+            f"<|im_start|>tool\n"
+            f"Call ID: {message.tool_call_id}\n"
+            f"Result: {content}\n"
+            f"<|im_end|>\n"
+        )
+
+    if message.role == "assistant" and message.tool_calls:
+        tool_calls_formatted = []
+        for tool_call in message.tool_calls:
+            fn = tool_call.get("function", {})
+            tool_calls_formatted.append({
+                "id": tool_call.get("id", ""),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}")
+            })
+        return f"<|im_start|>assistant\n{json.dumps(tool_calls_formatted)}<|im_end|>\n"
+
+    return f"<|im_start|>{message.role}\n{content}<|im_end|>\n"
+
+
+def _encode_len(tokenizer, text: str) -> int:
+    """Return the token length for a text snippet."""
+    encoded = tokenizer.encode(text, return_tensors="pt")
+    if hasattr(encoded, "shape"):
+        if len(encoded.shape) == 1:
+            return int(encoded.shape[0])
+        return int(encoded.shape[1])
+    return int(len(encoded))
+
+
+def _truncate_text_to_tokens(tokenizer, text: str, max_tokens: int) -> str:
+    """Truncate text to the first max_tokens tokens."""
+    if max_tokens <= 0:
+        return ""
+
+    encoded = tokenizer.encode(text, return_tensors="pt")
+    if hasattr(encoded, "shape") and len(encoded.shape) > 1:
+        return tokenizer.decode(encoded[0][:max_tokens], skip_special_tokens=False)
+    return tokenizer.decode(encoded[:max_tokens], skip_special_tokens=False)
+
+
+def build_prompt_sliding_window(
+    messages: List[ChatMessage],
+    tokenizer,
+    max_prompt_len: int,
+    system_override: str = "",
+) -> tuple[str, int]:
+    """
+    Build a ChatML prompt that fits within max_prompt_len tokens using a
+    sliding window strategy.
+
+    Strategy:
+    1. Always include the system message (tools injection or user system prompt)
+    2. Always include the LAST (most recent) user message
+    3. Fill remaining token budget with as many prior turns as possible,
+       working backwards from the newest message
+    4. Never truncate mid-message — drop whole turns only
+
+    Returns (prompt_string, token_count).
+    """
+    assistant_marker = "<|im_start|>assistant\n"
+    assistant_tokens = _encode_len(tokenizer, assistant_marker)
+    remaining_budget = max(max_prompt_len - assistant_tokens, 0)
+
+    system_block = ""
+    system_index: Optional[int] = None
+
+    if system_override:
+        system_block = f"<|im_start|>system\n{system_override}<|im_end|>\n"
+        if messages and messages[0].role == "system":
+            system_index = 0
+    elif messages and messages[0].role == "system":
+        system_index = 0
+        system_block = _format_chatml_message(messages[0])
+
+    if system_block:
+        system_tokens = _encode_len(tokenizer, system_block)
+        if system_tokens > remaining_budget:
+            logger.warning(
+                "System block exceeded prompt budget; truncating system prompt to fit the reserved assistant marker"
+            )
+            system_block = _truncate_text_to_tokens(tokenizer, system_block, remaining_budget)
+            system_tokens = _encode_len(tokenizer, system_block)
+        remaining_budget = max(remaining_budget - system_tokens, 0)
+
+    last_user_index = next(
+        (
+            idx for idx in range(len(messages) - 1, -1, -1)
+            if idx != system_index and messages[idx].role == "user"
+        ),
+        None,
+    )
+
+    last_user_block = ""
+    last_user_tokens = 0
+    if last_user_index is not None:
+        last_user_block = _format_chatml_message(messages[last_user_index])
+        last_user_tokens = _encode_len(tokenizer, last_user_block)
+
+        if system_block and last_user_tokens > remaining_budget:
+            target_system_budget = max(max_prompt_len - assistant_tokens - last_user_tokens, 0)
+            if target_system_budget < _encode_len(tokenizer, system_block):
+                logger.warning(
+                    "Truncating system prompt further to preserve the most recent user turn in the sliding window"
+                )
+                system_block = _truncate_text_to_tokens(tokenizer, system_block, target_system_budget)
+                remaining_budget = max(max_prompt_len - assistant_tokens - _encode_len(tokenizer, system_block), 0)
+
+    candidate_indices = [
+        idx for idx in range(len(messages) - 1, -1, -1)
+        if idx != system_index
+    ]
+
+    selected_blocks_reversed: List[str] = []
+    last_user_included = last_user_index is None
+    dropped_turns = 0
+
+    for position, idx in enumerate(candidate_indices):
+        block = _format_chatml_message(messages[idx])
+        block_tokens = _encode_len(tokenizer, block)
+        reserved_budget = 0
+
+        if last_user_index is not None and not last_user_included and idx != last_user_index:
+            reserved_budget = last_user_tokens
+
+        if block_tokens + reserved_budget <= remaining_budget:
+            selected_blocks_reversed.append(block)
+            remaining_budget -= block_tokens
+            if idx == last_user_index:
+                last_user_included = True
+            continue
+
+        dropped_turns += 1
+
+        if last_user_index is not None and not last_user_included and idx > last_user_index:
+            continue
+
+        dropped_turns += len(candidate_indices) - position - 1
+        break
+
+    selected_blocks = list(reversed(selected_blocks_reversed))
+    prompt = system_block + "".join(selected_blocks) + assistant_marker
+    input_length = _encode_len(tokenizer, prompt)
+
+    while input_length > max_prompt_len and selected_blocks:
+        dropped_turns += 1
+        selected_blocks.pop(0)
+        prompt = system_block + "".join(selected_blocks) + assistant_marker
+        input_length = _encode_len(tokenizer, prompt)
+
+    if input_length > max_prompt_len and system_block:
+        system_budget = max(max_prompt_len - assistant_tokens, 0)
+        system_block = _truncate_text_to_tokens(tokenizer, system_block, system_budget)
+        prompt = system_block + "".join(selected_blocks) + assistant_marker
+        input_length = _encode_len(tokenizer, prompt)
+
+    if dropped_turns > 0:
+        logger.info(
+            f"Sliding window: dropped {dropped_turns} older turn(s) to fit {max_prompt_len} token budget"
+        )
+
+    return prompt, input_length
+
+
 # --- Routes ---
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
@@ -526,58 +705,20 @@ async def chat_completions(request: ChatCompletionRequest):
     
     # Check if tools are disabled via tool_choice
     use_tools = request.tools and request.tool_choice != "none"
-    
-    # Build prompt with tool support
-    prompt = ""
-    has_system = False
-    
-    # If tools are provided (and not disabled), inject them into the system prompt
+
+    system_override = ""
     if use_tools:
         tools_prompt = format_tools_for_prompt(request.tools, request.tool_choice)
-        if tools_prompt:  # Will be empty if tool_choice="none"
-            prompt += f"<|im_start|>system\n{tools_prompt}<|im_end|>\n"
-            has_system = True
-    
-    # Format messages (ChatML format for Qwen/compatible models)
-    for msg in request.messages:
-        # Skip system message if we already added tools as system
-        if msg.role == "system" and has_system:
-            continue
-        
-        content = msg.content or ""
-        
-        # Handle tool results with better formatting
-        if msg.role == "tool" and msg.tool_call_id:
-            prompt += f"<|im_start|>tool\n"
-            prompt += f"Call ID: {msg.tool_call_id}\n"
-            prompt += f"Result: {content}\n"
-            prompt += "<|im_end|>\n"
-        # Handle assistant messages with tool calls
-        elif msg.role == "assistant" and msg.tool_calls:
-            # Format tool calls as clean JSON
-            tool_calls_formatted = []
-            for tc in msg.tool_calls:
-                fn = tc.get("function", {})
-                tool_calls_formatted.append({
-                    "id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "arguments": fn.get("arguments", "{}")
-                })
-            prompt += f"<|im_start|>assistant\n{json.dumps(tool_calls_formatted)}<|im_end|>\n"
-        else:
-            prompt += f"<|im_start|>{msg.role}\n{content}<|im_end|>\n"
-    
-    prompt += "<|im_start|>assistant\n"
+        if tools_prompt:
+            system_override = tools_prompt
 
-    # Encode and check length
+    prompt, input_length = build_prompt_sliding_window(
+        messages=request.messages,
+        tokenizer=tokenizer,
+        max_prompt_len=max_prompt_len,
+        system_override=system_override,
+    )
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
-    input_length = input_ids.shape[1]
-    
-    # Truncate input if too long (keep last max_prompt_len tokens)
-    if input_length > max_prompt_len:
-        input_ids = input_ids[:, -max_prompt_len:]
-        input_length = max_prompt_len
-        logger.warning(f"Input truncated to {max_prompt_len} tokens")
     
     # Cap max_new_tokens to stay within context limit
     available_tokens = max_context_len - input_length - 10
@@ -598,7 +739,7 @@ async def chat_completions(request: ChatCompletionRequest):
         
         async def generate_with_lock():
             global is_generating
-            async with npu_resource_lock:
+            async with get_model_lock(request.model):
                 is_generating = True
                 try:
                     await asyncio.get_running_loop().run_in_executor(None, lambda: model.generate(input_ids, **gen_kwargs))
@@ -715,7 +856,7 @@ async def chat_completions(request: ChatCompletionRequest):
         global is_generating  # Must be declared at function scope, not inside loops
         
         while retry_count <= MAX_RETRY_ATTEMPTS:
-            async with npu_resource_lock:
+            async with get_model_lock(request.model):
                 is_generating = True
                 try:
                     with torch.no_grad():
@@ -733,14 +874,17 @@ async def chat_completions(request: ChatCompletionRequest):
                 retry_count += 1
                 if retry_count <= MAX_RETRY_ATTEMPTS:
                     logger.warning(f"Malformed tool call detected, retry {retry_count}/{MAX_RETRY_ATTEMPTS}")
-                    # Add retry prompt
-                    retry_prompt = prompt + generated_text + "<|im_end|>\n"
-                    retry_prompt += f"<|im_start|>user\n{get_retry_prompt()}<|im_end|>\n"
-                    retry_prompt += "<|im_start|>assistant\n"
+                    retry_messages = list(request.messages) + [
+                        ChatMessage(role="assistant", content=generated_text),
+                        ChatMessage(role="user", content=get_retry_prompt()),
+                    ]
+                    retry_prompt, _ = build_prompt_sliding_window(
+                        messages=retry_messages,
+                        tokenizer=tokenizer,
+                        max_prompt_len=max_prompt_len,
+                        system_override=system_override,
+                    )
                     current_input_ids = tokenizer.encode(retry_prompt, return_tensors="pt")
-                    # Re-truncate if needed
-                    if current_input_ids.shape[1] > max_prompt_len:
-                        current_input_ids = current_input_ids[:, -max_prompt_len:]
                     continue
             break
         
@@ -839,7 +983,7 @@ async def create_response(request: ResponseRequest):
     
     # Generate response
     global is_generating
-    async with npu_resource_lock:
+    async with get_model_lock(request.model):
         is_generating = True
         try:
             with torch.no_grad():
@@ -933,7 +1077,11 @@ async def system_status():
         },
         "npu": {
             "config": os.environ.get("IPEX_LLM_NPU_MTL", "non-MTL"),
-            "busy": is_generating or npu_resource_lock.locked()
+            "busy": any(lock.locked() for lock in model_locks.values()) or npu_resource_lock.locked(),
+            "model_locks": {
+                mid: model_locks[mid].locked()
+                for mid in model_locks
+            }
         },
         "disk": {
             "npu_cache_gb": npu_cache_gb,
