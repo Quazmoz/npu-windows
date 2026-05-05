@@ -17,8 +17,10 @@ Run Large Language Models on your Intel Core Ultra NPU with an OpenAI-compatible
 
 ## 🎥 Demos
 
-- **Quick Overview & Speed Test**: [Intel NPU LLM - UI & Performance Demo](https://youtu.be/00RTemT1Bbs)
-- **Feature Deep Dive**: [Building with Intel NPU & OpenAI API](https://youtu.be/6F6LbR2Xjcg)
+| Quick Overview & Speed Test | Feature Deep Dive |
+| :---: | :---: |
+| [![Intel NPU LLM - UI & Performance Demo](https://img.youtube.com/vi/00RTemT1Bbs/0.jpg)](https://www.youtube.com/watch?v=00RTemT1Bbs) | [![Building with Intel NPU & OpenAI API](https://img.youtube.com/vi/6F6LbR2Xjcg/0.jpg)](https://www.youtube.com/watch?v=6F6LbR2Xjcg) |
+| **Intel NPU LLM - UI & Performance Demo** | **Building with Intel NPU & OpenAI API** |
 
 ## 📋 Requirements
 
@@ -71,7 +73,7 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ### 2. Start the NPU Backend (Multiple Models)
 
 ```powershell
-# From the project root - loads 2 models by default
+# From the project root - loads 1 model by default (qwen1.5-1.8b)
 .\start_backend.bat
 
 > **Note**: `start_backend.bat` automatically detects your processor (Meteor Lake vs Arrow/Lunar Lake) and configures the `IPEX_LLM_NPU_MTL` variable for you.
@@ -80,11 +82,6 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 Or load specific models:
 ```powershell
 .\start_backend.bat --models "qwen1.5-1.8b,llama3.2-1b,qwen1.5-4b"
-```
-
-Or load specific models:
-```powershell
-.\start_backend.bat --models "qwen1.5-4b"
 ```
 
 List all available models:
@@ -134,6 +131,9 @@ Open **http://localhost:8000** in your browser for a full-featured chat interfac
 - `/v1/chat/completions` — OpenAI Chat Completions API (Open WebUI, LangChain, curl)
 - `/v1/responses` — OpenAI Responses API (N8N)
 - `/v1/models` — List loaded models
+- `/v1/models/load` — Queue a model to load into memory
+- `/v1/models/unload` — Unload a model from memory
+- `/v1/models/delete` — Delete local model caches (HF & NPU)
 - `/v1/system/status` — System telemetry (memory, CPU, NPU busy state)
 - `/health` — Health check
 
@@ -267,12 +267,19 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 
 ## ⚡ NPU vs CPU/GPU
 
+### Power & Efficiency (Typical)
 | Metric | NPU | CPU | iGPU |
 |--------|-----|-----|------|
 | Power Draw | ~5-10W | 15-45W | 20-35W |
-| TOPS (INT8) | 11 TOPS | ~2-3 TOPS | ~8 TOPS |
 | Battery Life | Hours | ~1 hour | ~2 hours |
-| Best For | Efficiency | Fallback | Larger models |
+| Best For | Efficiency, Background Tasks | Fallback | Max Performance, Larger models |
+
+### Performance by Processor Generation (INT8 TOPS)
+| Processor Architecture | NPU TOPS | GPU TOPS | CPU TOPS | Total Platform TOPS |
+|------------------------|----------|----------|----------|---------------------|
+| **Core Ultra Series 1 (Meteor Lake)** *(e.g., Core Ultra 9 185H)* | ~11 TOPS | ~18 TOPS | ~5 TOPS | ~34 TOPS |
+| **Core Ultra Series 2 (Arrow Lake)** | ~13 TOPS | ~18 TOPS | ~5 TOPS | ~36 TOPS |
+| **Core Ultra Series 2 (Lunar Lake)** | 48 TOPS | ~67 TOPS | ~5 TOPS | ~120 TOPS |
 
 ---
 
