@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore", message=".*pkg_resources.*")
 warnings.filterwarnings("ignore", message=".*resume_download.*")
 
 import argparse
+import importlib.util
 import uvicorn
 import time
 import uuid
@@ -23,9 +24,11 @@ import re
 import contextlib
 import shutil
 import gc
+import sys
 from pathlib import Path
 from threading import Thread
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
@@ -39,6 +42,20 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("npu-server")
+
+
+def configure_console_output() -> None:
+    """Prefer UTF-8 console output on Windows to avoid Unicode crashes."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
+
+
+configure_console_output()
 
 # Load .env file for HuggingFace token
 def find_and_load_dotenv():
@@ -68,9 +85,151 @@ else:
     logger.warning("No HuggingFace token found. Gated models (Llama) will not work.")
     logger.info("To use Llama models, create a .env file with: HF_TOKEN=hf_your_token_here")
 
-# CRITICAL: Use the NPU-specific model loader!
-from ipex_llm.transformers.npu_model import AutoModelForCausalLM
-from transformers import AutoTokenizer, TextIteratorStreamer
+class RuntimeDependencyError(RuntimeError):
+    """Raised when the Intel NPU Python runtime is missing or incompatible."""
+
+    def __init__(
+        self,
+        message: str,
+        missing_modules: Optional[List[str]] = None,
+        original_exc: Optional[BaseException] = None,
+    ) -> None:
+        super().__init__(message)
+        self.missing_modules = missing_modules or []
+        self.original_exc = original_exc
+
+
+AutoModelForCausalLM = None
+AutoTokenizer = None
+TextIteratorStreamer = None
+runtime_dependency_error: Optional[RuntimeDependencyError] = None
+
+
+def _installed_version(distribution_name: str) -> str:
+    """Return an installed distribution version or 'not installed'."""
+    try:
+        return version(distribution_name)
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def format_runtime_dependency_error(exc: RuntimeDependencyError) -> str:
+    """Return an actionable error message for broken Intel NPU environments."""
+    missing_modules = exc.missing_modules or []
+    requirements_path = Path(__file__).parent / "requirements.txt"
+
+    lines = [
+        "ERROR: Intel NPU Python dependencies are missing or incompatible in the active environment.",
+        f"Python: {sys.executable}",
+        f"ipex-llm: {_installed_version('ipex-llm')}",
+        f"bigdl-core-npu: {_installed_version('bigdl-core-npu')}",
+        f"neural-compressor: {_installed_version('neural-compressor')}",
+        f"setuptools: {_installed_version('setuptools')}",
+    ]
+
+    if missing_modules:
+        lines.append(f"Missing module(s): {', '.join(missing_modules)}")
+
+    if "neural_compressor.adaptor" in missing_modules:
+        lines.extend([
+            "",
+            "This usually means the active 'ipex-npu' environment has an incompatible or partial",
+            "'neural-compressor' / 'ipex-llm' install.",
+            "",
+            "Recommended fix in PowerShell:",
+            "  conda activate ipex-npu",
+            "  python -m pip uninstall -y ipex-llm bigdl-core-npu neural-compressor",
+            "  python -m pip install --pre --upgrade ipex-llm[npu]",
+            f"  python -m pip install -r \"{requirements_path}\"",
+            "  python -c \"import neural_compressor.adaptor; print('Intel NPU runtime OK')\"",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Recommended fix in PowerShell:",
+            "  conda activate ipex-npu",
+            "  python -m pip install --pre --upgrade ipex-llm[npu]",
+            f"  python -m pip install -r \"{requirements_path}\"",
+        ])
+
+    lines.extend([
+        "",
+        "Note: the 'pkg_resources' warning is noisy but not fatal by itself.",
+    ])
+
+    if exc.original_exc:
+        lines.extend([
+            "",
+            f"Original error: {exc.original_exc}",
+        ])
+
+    return "\n".join(lines)
+
+
+def ensure_runtime_dependencies(raise_on_error: bool = False) -> bool:
+    """Import and validate the Intel NPU runtime lazily."""
+    global AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, runtime_dependency_error
+
+    if all(obj is not None for obj in (AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer)):
+        return True
+
+    try:
+        required_modules = [
+            "ipex_llm",
+            "transformers",
+            "torch",
+            "neural_compressor",
+            "neural_compressor.adaptor",
+        ]
+        missing_modules = [
+            module_name
+            for module_name in required_modules
+            if importlib.util.find_spec(module_name) is None
+        ]
+        if missing_modules:
+            raise RuntimeDependencyError(
+                "Missing Intel NPU Python modules.",
+                missing_modules=missing_modules,
+            )
+
+        from ipex_llm.transformers.npu_model import AutoModelForCausalLM as _AutoModelForCausalLM
+        from transformers import AutoTokenizer as _AutoTokenizer
+        from transformers import TextIteratorStreamer as _TextIteratorStreamer
+
+        AutoModelForCausalLM = _AutoModelForCausalLM
+        AutoTokenizer = _AutoTokenizer
+        TextIteratorStreamer = _TextIteratorStreamer
+        runtime_dependency_error = None
+        return True
+    except RuntimeDependencyError as exc:
+        runtime_dependency_error = exc
+    except ModuleNotFoundError as exc:
+        runtime_dependency_error = RuntimeDependencyError(
+            "Intel NPU runtime import failed.",
+            missing_modules=[exc.name] if exc.name else [],
+            original_exc=exc,
+        )
+    except ImportError as exc:
+        runtime_dependency_error = RuntimeDependencyError(
+            "Intel NPU runtime import failed.",
+            original_exc=exc,
+        )
+
+    if raise_on_error and runtime_dependency_error is not None:
+        raise SystemExit(format_runtime_dependency_error(runtime_dependency_error))
+
+    return False
+
+
+def print_runtime_summary() -> None:
+    """Print a concise runtime health summary for support/debugging."""
+    print("Intel NPU runtime: OK")
+    print(f"Python: {sys.executable}")
+    print(f"ipex-llm: {_installed_version('ipex-llm')}")
+    print(f"bigdl-core-npu: {_installed_version('bigdl-core-npu')}")
+    print(f"neural-compressor: {_installed_version('neural-compressor')}")
+    print(f"torch: {_installed_version('torch')}")
+    print(f"transformers: {_installed_version('transformers')}")
 
 # --- Available Models Configuration ---
 def load_models_config():
@@ -511,6 +670,9 @@ class ResponseObject(BaseModel):
 def load_npu_model(model_id: str, hf_model_path: str):
     """Load a single model with NPU optimization."""
     global loaded_models
+    if not ensure_runtime_dependencies():
+        raise RuntimeError(format_runtime_dependency_error(runtime_dependency_error))
+
     max_context_len, max_prompt_len = get_model_context_limits(model_id)
     
     logger.info(f"Loading '{model_id}' ({hf_model_path}) for Intel NPU...")
@@ -1496,6 +1658,7 @@ if __name__ == "__main__":
     default_port = int(os.environ.get("PORT", 8000))
     parser.add_argument("--port", type=int, default=default_port, help=f"Port to run server on (default: {default_port})")
     parser.add_argument("--list", action="store_true", help="List available models and exit")
+    parser.add_argument("--check-env", action="store_true", help="Validate the Intel NPU Python environment and exit")
     args = parser.parse_args()
     
     if args.list:
@@ -1507,6 +1670,13 @@ if __name__ == "__main__":
             print(f"                    HF: {info['hf_id']}")
             print()
         exit(0)
+
+    if args.check_env:
+        ensure_runtime_dependencies(raise_on_error=True)
+        print_runtime_summary()
+        exit(0)
+
+    ensure_runtime_dependencies(raise_on_error=True)
     
     # Parse model list
     model_ids_to_load = [m.strip() for m in args.models.split(",") if m.strip()]

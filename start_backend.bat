@@ -83,6 +83,9 @@ if errorlevel 1 (
 echo Conda: !CONDA_PATH! [ipex-npu]
 echo.
 
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 if not exist "%~dp0.deps_installed" (
     echo Installing dependencies ^(first run only^)...
     pip install -r "%~dp0intel-npu-llm\requirements.txt"
@@ -99,6 +102,23 @@ if not exist "%~dp0.deps_installed" (
 echo.
 
 cd /d "%~dp0intel-npu-llm"
+
+set SKIP_ENV_CHECK=
+for %%A in (%*) do (
+    if /i "%%~A"=="--list" set SKIP_ENV_CHECK=1
+)
+
+if not defined SKIP_ENV_CHECK (
+    echo Verifying Intel NPU Python environment...
+    python npu_server.py --check-env
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Intel NPU runtime check failed.
+        pause
+        exit /b 1
+    )
+    echo.
+)
 
 REM ---- Check port availability ----
 set PORT=8000
