@@ -24,8 +24,8 @@ Run Large Language Models on your Intel Core Ultra NPU with an OpenAI-compatible
 
 ## 📋 Requirements
 
-- **Processor**: Intel Core Ultra (Meteor Lake, Arrow Lake, or Lunar Lake)
-- **OS**: Windows 11
+- **Processor**: Intel Core Ultra with an Intel NPU / AI Boost device present. Meteor Lake, Arrow Lake, and Lunar Lake are known profiles; newer Core Ultra variants continue with a warning if preflight checks pass.
+- **OS**: Windows 11 (build 22000 or newer)
 - **NPU Driver**: Version 32.0.100.3104 or newer
 - **Python**: 3.11 (managed via Miniconda)
 - **Docker Desktop**: For Open WebUI frontend (optional)
@@ -34,36 +34,70 @@ Run Large Language Models on your Intel Core Ultra NPU with an OpenAI-compatible
 
 ### 1. Install Dependencies (First Time Only)
 
+The easiest way is to run the included setup script — it handles Miniconda, the conda
+environment, and all Python packages automatically:
+
+```bat
+.\setup.bat
+```
+
+> **What it does:** Installs Miniconda if missing, creates the `ipex-npu` conda
+> environment (Python 3.11), installs `ipex-llm[npu]` and all server dependencies,
+> and optionally saves a HuggingFace token. Each step is skipped if already complete —
+> safe to re-run after failures.
+
+> **Hardware preflight:** `setup.bat` now checks Windows build, CPU family, Intel NPU
+> driver version, and any blocked BIOS versions listed in `setup/compatibility.json`
+> before it installs anything.
+
+Optional setup overrides:
+```powershell
+.\setup.bat -AllowUnsupportedHardware
+.\setup.bat -SkipDriverCheck
+.\setup.bat -EnvName my-ipex-npu
+```
+
+Support and validation tools:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\collect_support_info.ps1
+powershell -ExecutionPolicy Bypass -File .\setup\test_compatibility_matrix.ps1
+```
+
+> **Note:** If Miniconda is installed for the first time, the script will ask you to
+> close and reopen the terminal, then run `.\setup.bat` again to finish.
+
+<details>
+<summary>Manual setup (advanced)</summary>
+
 ```powershell
 # Install Miniconda (if not installed)
 winget install Anaconda.Miniconda3
+# Reopen terminal, then:
 
-# Create Python environment
 conda create -n ipex-npu python=3.11 -y
 conda activate ipex-npu
 
-# Install ipex-llm with NPU support
 pip install --pre --upgrade ipex-llm[npu]
-
-# Install server dependencies
 pip install -r intel-npu-llm/requirements.txt
 ```
 
+</details>
+
 ### 1b. HuggingFace Authentication (For Gated Models)
 
-Some models (Llama 2, Llama 3, Llama 3.2) require HuggingFace authentication:
+Some models (Llama 2, Llama 3, Llama 3.2) require HuggingFace authentication.
+`setup.bat` prompts for this automatically. To set it up manually:
 
 1. **Create a HuggingFace account** at [huggingface.co](https://huggingface.co)
 2. **Accept the model license** - Visit the model page (e.g., [meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)) and accept the terms
 3. **Generate an access token** at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-4. **Create a `.env` file** in the project root:
+4. Run the token setup script:
 
-```powershell
-# Create .env file with your token (UTF-8 encoding is important!)
-'HF_TOKEN=hf_your_token_here' | Out-File -FilePath .env -Encoding utf8
+```bat
+powershell -ExecutionPolicy Bypass -File .\setup\04_hf_token.ps1
 ```
 
-Or manually create `npu-windows/.env`:
+Or create `intel-npu-llm/.env` manually:
 ```
 HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
@@ -74,29 +108,45 @@ HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ```powershell
 # From the project root - loads 1 model by default (qwen1.5-1.8b)
-.\start_backend.bat
+.\start_server.bat
 
-> **Note**: `start_backend.bat` automatically detects your processor (Meteor Lake vs Arrow/Lunar Lake) and configures the `IPEX_LLM_NPU_MTL` variable for you.
+> **Note**: `start_server.bat` runs the same hardware preflight before startup and
+> auto-configures `IPEX_LLM_NPU_MTL` for known Meteor Lake systems. Unknown/newer
+> Core Ultra generations continue in a generic profile unless preflight blocks them.
+```
+
+Useful startup overrides (PowerShell):
+```powershell
+$env:NPU_CONDA_ENV = 'ipex-npu'
+$env:NPU_ALLOW_UNSUPPORTED = '1'
+$env:NPU_SKIP_DRIVER_CHECK = '1'
+$env:NPU_SKIP_PREFLIGHT = '1'
+.\start_server.bat --list
+```
+
+For bug reports, generate a redacted support bundle:
+```powershell
+.\start_server.bat --diagnose
 ```
 
 Or load specific models:
 ```powershell
-.\start_backend.bat --models "qwen1.5-1.8b,llama3.2-1b,qwen1.5-4b"
+.\start_server.bat --models "qwen1.5-1.8b,llama3.2-1b,qwen1.5-4b"
 ```
 
 List all available models:
 ```powershell
-.\start_backend.bat --list
+.\start_server.bat --list
 ```
 
 Change the server port (if 8000 is occupied):
 ```powershell
-.\start_backend.bat --port 8001
+.\start_server.bat --port 8001
 ```
 
 Mixed usage:
 ```powershell
-.\start_backend.bat --models "qwen1.5-4b" --port 8080
+.\start_server.bat --models "qwen1.5-4b" --port 8080
 ```
 
 Or manually:
@@ -258,7 +308,7 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 ### Load Multiple Models
 
 ```powershell
-.\start_backend.bat --models "qwen2.5-3b,llama3.2-1b,minicpm-2b"
+.\start_server.bat --models "qwen2.5-3b,llama3.2-1b,minicpm-2b"
 ```
 
 > **Note**: First run downloads and compiles each model (1-3 min). Subsequent loads are instant from cache.
@@ -290,8 +340,24 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 | Variable | Value | Description |
 |----------|-------|-------------|
 | `IPEX_LLM_NPU_MTL` | `1` | Required for Meteor Lake (Core Ultra Series 1) |
+| `NPU_CONDA_ENV` | env name | Conda environment that `start_server.bat` activates |
+| `NPU_ALLOW_UNSUPPORTED` | `1` | Continue past preflight failures with warnings |
+| `NPU_SKIP_DRIVER_CHECK` | `1` | Skip only the Intel NPU driver version check |
+| `NPU_SKIP_PREFLIGHT` | `1` | Bypass all startup hardware checks |
 | `HF_HOME` | path | Hugging Face cache directory |
+| `REQUESTS_CA_BUNDLE` | path | Optional custom CA bundle for HTTPS model downloads |
+| `SSL_CERT_FILE` | path | Alternate way to point Python HTTPS clients at a CA bundle |
 | `PORT` | `8001` | Default port for the server |
+
+### Compatibility Data
+
+`setup/compatibility.json` is the repo's compatibility policy file.
+
+- `blockedBiosVersions`: hard blocks specific BIOS/firmware versions.
+- `knownValidatedCombos`: records reported-good CPU / BIOS / driver combinations.
+- `knownProblemCombos`: records reported-bad combinations, either as errors or warnings.
+
+Keep speculative entries out of this file. Add only combinations that came from real machine reports or direct validation.
 
 ### Processor-Specific Settings
 
@@ -309,6 +375,9 @@ All models below are **officially verified** for Intel NPU via ipex-llm:
 1. Check Device Manager → Neural processors → Intel(R) AI Boost
 2. Update NPU driver to latest version
 3. Ensure `IPEX_LLM_NPU_MTL=1` is set for Meteor Lake
+4. Run `.\setup\00_hardware_preflight.ps1` to see the exact compatibility failure
+5. If a BIOS release is known-bad for your machine, add it to `setup/compatibility.json` under `blockedBiosVersions`
+6. Run `.\start_server.bat --diagnose` and attach the generated JSON when reporting an issue
 
 ### Generation Hangs
 - First generation takes 1-3 minutes for NPU warmup
@@ -328,6 +397,14 @@ This happens when the `.env` file was saved in UTF-16 (the default for PowerShel
 'HF_TOKEN=hf_your_token_here' | Out-File -FilePath .env -Encoding utf8
 ```
 Or open the file in Notepad → **File > Save As** → set **Encoding: UTF-8**.
+
+### Hugging Face TLS Error (`SSLCertVerificationError` / `unable to get local issuer certificate`)
+Current setup installs `python-certifi-win32`, which lets Python use the Windows certificate store for Hugging Face downloads.
+
+If your environment was created before this dependency was added:
+1. Re-run `./setup.bat --skip-hf-token`
+2. Or install the fix directly: `conda run -n ipex-npu pip install python-certifi-win32`
+3. If your organization provides a custom CA bundle, set `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE` to that `.pem` file before starting the server
 
 ---
 
@@ -426,7 +503,7 @@ The NPU cache location is fixed at `intel-npu-llm\npu_model_cache\` relative to 
 
 ```
 npu-windows/
-├── start_backend.bat             # One-click startup with auto CPU detection
+├── start_server.bat             # One-click startup with auto CPU detection
 ├── QUICKSTART.md                 # 5-minute getting started guide
 ├── README.md                     # Full documentation
 └── intel-npu-llm/

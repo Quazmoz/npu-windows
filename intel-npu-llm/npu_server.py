@@ -21,6 +21,7 @@ import os
 import logging
 import psutil
 import re
+import ssl
 import contextlib
 import shutil
 import gc
@@ -56,6 +57,34 @@ def configure_console_output() -> None:
 
 
 configure_console_output()
+
+
+def configure_https_trust() -> None:
+    """Prefer the Windows certificate store for outbound HTTPS requests."""
+    custom_ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if custom_ca_bundle:
+        logger.info(f"HTTPS trust: using custom CA bundle {custom_ca_bundle}")
+        return
+
+    if os.name != "nt":
+        return
+
+    try:
+        import certifi
+        import certifi_win32  # noqa: F401  # imported for side effects
+
+        patched_ca_bundle = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", patched_ca_bundle)
+        os.environ.setdefault("SSL_CERT_FILE", patched_ca_bundle)
+        logger.info("HTTPS trust: Windows certificate store via python-certifi-win32")
+    except ImportError:
+        logger.warning(
+            "python-certifi-win32 is not installed. HTTPS model downloads may fail on Windows networks "
+            "that rely on the local machine or enterprise root certificate store."
+        )
+
+
+configure_https_trust()
 
 # Load .env file for HuggingFace token
 def find_and_load_dotenv():
@@ -230,6 +259,41 @@ def print_runtime_summary() -> None:
     print(f"neural-compressor: {_installed_version('neural-compressor')}")
     print(f"torch: {_installed_version('torch')}")
     print(f"transformers: {_installed_version('transformers')}")
+
+
+def _is_tls_certificate_error(exc: BaseException) -> bool:
+    """Return True when an exception chain contains a TLS certificate validation failure."""
+    current: Optional[BaseException] = exc
+    seen_ids = set()
+
+    while current is not None and id(current) not in seen_ids:
+        seen_ids.add(id(current))
+        text = f"{type(current).__name__}: {current}"
+        if (
+            "SSLCertVerificationError" in text
+            or "CERTIFICATE_VERIFY_FAILED" in text
+            or "unable to get local issuer certificate" in text
+            or isinstance(current, ssl.SSLCertVerificationError)
+        ):
+            return True
+
+        current = current.__cause__ or current.__context__
+
+    return False
+
+
+def format_model_load_error(exc: BaseException) -> str:
+    """Return a concise, actionable model-load error for UI and logs."""
+    if _is_tls_certificate_error(exc):
+        ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+        bundle_hint = f" Active CA bundle: {ca_bundle}." if ca_bundle else ""
+        return (
+            "HTTPS download failed while contacting huggingface.co. Python could not verify the TLS "
+            "certificate. On Windows, install python-certifi-win32 or set REQUESTS_CA_BUNDLE / "
+            "SSL_CERT_FILE to your organization CA bundle, then retry." + bundle_hint
+        )
+
+    return str(exc)
 
 # --- Available Models Configuration ---
 def load_models_config():
@@ -478,8 +542,9 @@ async def _load_single_model_task(model_id: str) -> None:
     except Exception as e:
         loaded_models.pop(model_id, None)
         model_locks.pop(model_id, None)
-        set_model_status(model_id, "error", phase="error", error=str(e))
-        logger.exception(f"Failed to load model '{model_id}': {e}")
+        user_error = format_model_load_error(e)
+        set_model_status(model_id, "error", phase="error", error=user_error)
+        logger.exception(f"Failed to load model '{model_id}': {user_error}")
 
 
 def schedule_model_load(model_id: str) -> Optional[asyncio.Task]:
@@ -683,7 +748,9 @@ def load_npu_model(model_id: str, hf_model_path: str):
     # Create cache directory for NPU model
     model_cache_dir = str(get_npu_cache_dir(hf_model_path))
     
-    if not os.path.exists(model_cache_dir):
+    cache_is_valid = os.path.isfile(os.path.join(model_cache_dir, "config.json"))
+
+    if not cache_is_valid:
         # Create parent directories and convert model
         os.makedirs(model_cache_dir, exist_ok=True)
         logger.info(f"Converting model to NPU format (first time only)...")
@@ -702,7 +769,7 @@ def load_npu_model(model_id: str, hf_model_path: str):
         tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
         tokenizer.save_pretrained(model_cache_dir)
         logger.info(f" -> Model converted and cached.")
-    else:
+    else:  # cache_is_valid
         logger.info(f"Loading from cache: {model_cache_dir}")
         model = AutoModelForCausalLM.load_low_bit(
             model_cache_dir,

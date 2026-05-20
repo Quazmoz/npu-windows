@@ -1,0 +1,49 @@
+{
+  "minimumWindowsBuild": 22000,
+  "minimumNpuDriverVersion": "32.0.100.3104",
+  "driverNamePatterns": [
+    "Intel\\(R\\) AI Boost",
+    "Intel\\(R\\) NPU",
+    "Intel\\(R\\) Gaussian",
+    "Intel\\(R\\) VPU",
+    "Intel.*AI Boost",
+    "Intel.*NPU"
+  ],
+  "driverSearchTerms": [
+    "AI Boost",
+    "NPU",
+    "Gaussian",
+    "VPU"
+  ],
+  "knownValidatedCombos": [],
+  "knownProblemCombos": [],
+  "cpuProfiles": [
+    {
+      "id": "meteor-lake",
+      "label": "Intel Core Ultra Series 1 - Meteor Lake",
+      "match": "Ultra.*1[0-9][0-9][A-Z]",
+      "requiredEnv": {
+        "IPEX_LLM_NPU_MTL": "1"
+      }
+    },
+    {
+      "id": "lunar-lake",
+      "label": "Intel Core Ultra Series 2 - Lunar Lake",
+      "match": "Ultra.*2[0-9][0-9]V",
+      "requiredEnv": {}
+    },
+    {
+      "id": "arrow-lake",
+      "label": "Intel Core Ultra Series 2 - Arrow Lake",
+      "match": "Ultra.*2[0-9][0-9][HKS]",
+      "requiredEnv": {}
+    },
+    {
+      "id": "core-ultra-generic",
+      "label": "Intel Core Ultra (generation not mapped yet)",
+      "match": "Ultra",
+      "requiredEnv": {}
+    }
+  ],
+  "blockedBiosVersions": []
+}

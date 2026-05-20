@@ -43,5 +43,5 @@ Thumbs.db
 # Conda
 *.conda
 
-# Dependency install marker (auto-created by start_backend.bat)
+# Dependency install marker (auto-created by start_server.bat)
 .deps_installed

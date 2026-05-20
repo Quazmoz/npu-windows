@@ -7,13 +7,40 @@ Get your Intel NPU running LLMs in under 10 minutes.
 
 ## Prerequisites
 
-- Intel Core Ultra processor (Series 1 Meteor Lake, Series 2 Arrow Lake, or Lunar Lake)
-- Windows 11
+- Intel Core Ultra processor with an Intel NPU / AI Boost device present
+- Windows 11 (build 22000 or newer)
+- Intel NPU driver 32.0.100.3104 or newer
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) *(optional — only needed for Open WebUI)*
 
 ---
 
 ## Step 1: Install Dependencies *(First Time Only)*
+
+Recommended path:
+
+```powershell
+.\setup.bat
+```
+
+This now includes a hardware preflight for Windows build, CPU profile, Intel NPU
+driver version, and any blocked BIOS versions listed in `setup/compatibility.json`.
+
+Useful setup overrides:
+
+```powershell
+.\setup.bat -AllowUnsupportedHardware
+.\setup.bat -SkipDriverCheck
+.\setup.bat -EnvName my-ipex-npu
+```
+
+Support and validation tools:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\collect_support_info.ps1
+powershell -ExecutionPolicy Bypass -File .\setup\test_compatibility_matrix.ps1
+```
+
+Manual fallback:
 
 ```powershell
 # 1. Install Miniconda (if not installed)
@@ -47,7 +74,23 @@ Llama 2, Llama 3, and Llama 3.2 require accepting the license and a HF token.
 ## Step 2: Start the Backend
 
 ```powershell
-.\start_backend.bat
+.\start_server.bat
+```
+
+Optional startup overrides:
+
+```powershell
+$env:NPU_ALLOW_UNSUPPORTED = '1'
+$env:NPU_SKIP_DRIVER_CHECK = '1'
+$env:NPU_SKIP_PREFLIGHT = '1'
+$env:NPU_CONDA_ENV = 'my-ipex-npu'
+.\start_server.bat --list
+```
+
+Need a support bundle for an issue report?
+
+```powershell
+.\start_server.bat --diagnose
 ```
 
 Wait for the ready message:
@@ -87,16 +130,16 @@ Then open **http://localhost:3000**
 
 ```powershell
 # Load a specific model
-.\start_backend.bat --models "qwen2.5-3b"
+.\start_server.bat --models "qwen2.5-3b"
 
 # Load multiple models (selectable from the UI dropdown)
-.\start_backend.bat --models "qwen1.5-1.8b,qwen1.5-4b"
+.\start_server.bat --models "qwen1.5-1.8b,qwen1.5-4b"
 
 # Use a different port
-.\start_backend.bat --port 8001
+.\start_server.bat --port 8001
 
 # List all available models
-.\start_backend.bat --list
+.\start_server.bat --list
 ```
 
 ---
@@ -131,7 +174,7 @@ If you have Open WebUI or N8N running elsewhere on your network:
 
 **Port already in use?**
 ```powershell
-.\start_backend.bat --port 8001
+.\start_server.bat --port 8001
 # or kill all Python processes:
 Get-Process python* | Stop-Process -Force
 ```
@@ -144,3 +187,11 @@ Get-Process python* | Stop-Process -Force
 1. Open Device Manager → Neural processors → should show "Intel(R) AI Boost"
 2. Update driver if missing
 3. For Meteor Lake (Series 1): ensure `IPEX_LLM_NPU_MTL=1` is set (the bat does this automatically)
+4. Run `.\setup\00_hardware_preflight.ps1` to see the exact compatibility failure
+5. Add known-bad BIOS versions to `setup/compatibility.json` if you need to block a firmware release for your fleet
+6. Run `.\start_server.bat --diagnose` and attach the generated JSON when reporting an issue
+
+**Hugging Face download fails with `SSLCertVerificationError`?**
+1. Re-run `./setup.bat --skip-hf-token` if your env was created before this fix landed
+2. Or run `conda run -n ipex-npu pip install python-certifi-win32`
+3. If your company uses a custom root CA bundle, set `REQUESTS_CA_BUNDLE` or `SSL_CERT_FILE` to that `.pem` before starting `./start_server.bat`
